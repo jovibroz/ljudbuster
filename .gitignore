@@ -1,35 +1,34 @@
-# LjudBuster .gitignore
-# Version: 1.0.0
-# Date: 2026-04-28
-# Changelog:
-# - Initial ignore rules for dev/live split
-# - Excludes runtime state, output, backups, secrets and caches
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
 
-# Runtime data
-state/
-output/
-cookies.txt
-*.cookies.txt
-history.json
+# Runtime/state
+state/*
+!state/.gitkeep
+logs/*
+!logs/.gitkeep
+downloads/*
+!downloads/.gitkeep
 
 # Local env/secrets
 .env
-.env.*
+*.env
+cookies.txt
+state/cookies.txt
 
-# Backups / recovery files
+# Backups
 *.bak
 *.bak-*
-*.current-before-*
-main.py.bak*
-main.py.current-before-*
-
-# Python/cache
-__pycache__/
-*.pyc
-.venv/
-venv/
+*.bak-before-*
+docker-compose.yml.bak-*
+.gitignore.bak-*
 
 # OS/editor
 .DS_Store
 .vscode/
 .idea/
+
+# Local Docker Compose override
+docker-compose.override.yml

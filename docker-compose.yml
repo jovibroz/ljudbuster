@@ -6,7 +6,6 @@
 # - Lade till tmpfs för /tmp (bättre temp-hantering i container)
 # - Behåller shm_size=1gb och befintliga live-mounts/state-upplägg
 
-version: '3.8'
 
 services:
   yt-fetcher:
@@ -28,15 +27,15 @@ services:
       - /tmp:size=512m
 
     volumes:
-      - /volume1/docker/yt-studio-fetcher/downloads:/output
+      - ./downloads:/output
 
       # Live-edit
-      - /volume1/docker/yt-studio-fetcher/main.py:/app/main.py
-      - /volume1/docker/yt-studio-fetcher/templates:/app/templates
-      - /volume1/docker/yt-studio-fetcher/entrypoint.sh:/app/entrypoint.sh
+      - ./app/main.py:/app/main.py
+      - ./app/templates:/app/templates
+      - ./entrypoint.sh:/app/entrypoint.sh
 
       # Persist state (cookies, update stamp, etc)
-      - /volume1/docker/yt-studio-fetcher/state:/app/state
+      - ./state:/app/state
 
     ports:
       - "8055:8000"

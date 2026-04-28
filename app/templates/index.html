@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <!-- LjudBuster UI Version: 1.8.7-dev.ui.4 | 2026-04-28 | Fixed history copy + balanced Media/Format help text -->
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0">
+    <title>LjudBuster {{ app_version }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;900&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #0b0d11; }
+        select {
+            background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%23475569' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e");
+            background-position: right 1.25rem center;
+            background-repeat: no-repeat;
+            background-size: 1.2em 1.2em;
+            padding-right: 3rem;
+            -webkit-appearance: none;
+            appearance: none;
+        }
+        .shimmer-bar { overflow: hidden; position: relative; }
+        .shimmer-bar::after {
+            content:""; position:absolute; inset:0;
+            background: linear-gradient(90deg, transparent, rgba(16,185,129,0.1), rgba(14,165,233,0.45), rgba(16,185,129,0.1), transparent);
+            animation: shimmer 1.5s linear infinite;
+        }
+        @keyframes shimmer { 0% { transform: translateX(-100%);} 100% { transform: translateX(200%);} }
+
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+    </style>
+</head>
+<body class="text-slate-300 min-h-screen flex items-center justify-center p-4 antialiased relative">
+
+    <div class="max-w-xl w-full bg-gradient-to-br from-[#14161a] to-[#0f131c] rounded-[3rem] sm:rounded-[4rem] shadow-2xl p-10 sm:p-16 border border-white/[0.04] relative z-10">
+
+        <header class="mb-12">
+            <div class="flex justify-between items-center">
+                <h1 class="text-4xl sm:text-[3.2rem] font-[900] text-white tracking-tighter uppercase italic leading-none">
+                    Ljud<span class="text-emerald-500 text-nowrap">Buster</span>
+                </h1>
+                <div class="flex items-center gap-3 bg-emerald-500/5 px-3 sm:px-4 py-2 rounded-2xl border border-emerald-500/10 shrink-0">
+                    <div class="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_12px_rgba(16,185,129,0.5)] animate-pulse"></div>
+                    <span class="text-[9px] font-black text-emerald-500 uppercase tracking-widest hidden sm:inline">Active</span>
+                </div>
+            </div>
+            <div class="mt-5 ml-1 flex items-baseline gap-4">
+                <p class="text-slate-500 text-xs font-bold uppercase tracking-[0.2em] shrink-0">Illens bäste vän</p>
+                <p class="text-[9px] sm:text-[10px] text-slate-400/70 font-bold uppercase tracking-[0.3em] italic">
+                    {{ app_version }}
+                </p>
+            </div>
+        </header>
+
+        <form id="dlForm" class="space-y-10 animate-in fade-in duration-500">
+            <div class="space-y-5">
+                <div class="flex justify-between items-end px-1">
+                    <label class="text-[11px] font-bold text-slate-500 uppercase tracking-[0.3em]">Källa (URL)</label>
+                    <button type="button" onclick="openHistory()" class="flex items-center gap-1.5 text-[10px] font-black text-emerald-500/80 hover:text-emerald-400 uppercase tracking-widest transition-colors" title="Visa senaste länkarna">
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        Historik
+                    </button>
+                </div>
+
+                <div class="relative flex items-center">
+                    <input type="url" name="url" id="urlInput" required autofocus
+                           placeholder="Klistra in länk här..."
+                           class="w-full pl-8 pr-16 py-6 sm:py-7 bg-black/40 border border-white/[0.08] rounded-2xl focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500/40 focus:outline-none text-white text-xl transition-all placeholder-slate-600 shadow-2xl">
+
+                    <button type="button" id="clearBtn" class="hidden absolute right-4 text-slate-600 hover:text-slate-300 p-2 transition-colors" title="Töm fältet">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+
+                <div class="px-1 pt-1">
+                    <p class="text-[11px] text-slate-600 font-medium uppercase tracking-widest leading-relaxed italic">
+                        Stödjer 1000+ sajter inkl. <span class="text-slate-500">SVT, SR, TV4, Aftonbladet, Expressen, TikTok, YouTube & Filmstaden Trailers</span>
+                    </p>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-5 sm:gap-8">
+                <div class="space-y-3">
+                    <label class="text-[11px] font-bold text-slate-500 uppercase tracking-[0.3em] ml-1">Media</label>
+                    <select name="mode" id="modeSelect" class="w-full px-6 py-4 sm:py-5 bg-black/20 border border-white/[0.06] rounded-2xl text-base focus:ring-2 focus:ring-emerald-500/10 outline-none cursor-pointer text-slate-400 hover:bg-black/30 transition-all">
+                        <option value="audio">Ljud</option>
+                        <option value="video">Video</option>
+                    </select>
+                    <p id="mediaDesc" class="text-[10px] text-slate-500 font-medium italic mt-3 ml-1 leading-relaxed min-h-8"></p>
+                </div>
+
+                <div class="space-y-3">
+                    <label class="text-[11px] font-bold text-slate-500 uppercase tracking-[0.3em] ml-1">Format</label>
+                    <select name="out_format" id="formatSelect" class="w-full px-6 py-4 sm:py-5 bg-black/20 border border-white/[0.06] rounded-2xl text-base focus:ring-2 focus:ring-emerald-500/10 outline-none cursor-pointer text-emerald-500 font-bold italic hover:bg-black/30 transition-all">
+                    </select>
+                    <p id="formatDesc" class="text-[10px] text-slate-500 font-medium italic mt-3 ml-1 leading-relaxed min-h-8"></p>
+                </div>
+            </div>
+
+            <div id="progressWrap" class="hidden space-y-6 pt-2 animate-in fade-in duration-500">
+                <div class="flex justify-between items-center px-1">
+                    <span class="text-[10px] font-black text-emerald-500/80 uppercase tracking-[0.3em]">Hämtning pågår</span>
+                    <span id="loadingText" class="text-[10px] font-mono text-blue-400/80 animate-pulse italic">Hög kvalitet prioriteras...</span>
+                </div>
+                <div class="h-2 w-full bg-white/[0.03] rounded-full shimmer-bar border border-white/[0.05]">
+                    <div class="h-full w-1/3 bg-emerald-500/30 rounded-full"></div>
+                </div>
+            </div>
+
+            <div class="pt-4">
+                <button type="submit" id="btn" class="w-full bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-600/20 text-white font-[900] py-7 sm:py-8 rounded-[2rem] transition-all shadow-2xl shadow-emerald-950/20 uppercase text-sm tracking-[0.5em] flex justify-center items-center group">
+                    <span id="btnText" class="group-hover:scale-105 transition-transform text-nowrap">STARTA HÄMTNING</span>
+                    <svg id="spinner" class="animate-spin ml-5 h-6 w-6 text-white hidden" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                </button>
+            </div>
+        </form>
+
+        <div id="status" class="p-8 sm:p-12 rounded-[3rem] border border-white/[0.05] hidden text-center transition-all animate-in zoom-in duration-500 shadow-2xl"></div>
+    </div>
+
+    <div id="historyModal" class="fixed inset-0 z-50 hidden flex-col items-center justify-center bg-[#0b0d11]/90 backdrop-blur-md p-4 animate-in fade-in duration-200">
+        <div class="bg-[#14161a] border border-white/10 rounded-[2.5rem] w-full max-w-2xl max-h-[85vh] flex flex-col shadow-2xl relative overflow-hidden">
+            <div class="p-6 sm:p-8 flex justify-between items-center border-b border-white/5 bg-gradient-to-r from-transparent via-white/[0.02] to-transparent">
+                <h2 class="text-sm font-[900] text-white uppercase tracking-[0.3em]">Senaste hämtningarna</h2>
+                <button onclick="closeHistory()" class="text-slate-500 hover:text-emerald-400 bg-white/5 hover:bg-white/10 p-2 rounded-full transition-colors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+
+            <div class="p-6 sm:p-8 overflow-y-auto custom-scrollbar flex-1 relative">
+                <div id="historyList" class="space-y-4"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const modeSelect = document.getElementById('modeSelect');
+        const formatSelect = document.getElementById('formatSelect');
+        const urlInput = document.getElementById('urlInput');
+        const clearBtn = document.getElementById('clearBtn');
+        const progressWrap = document.getElementById('progressWrap');
+        const loadingText = document.getElementById('loadingText');
+        const f = document.getElementById('dlForm');
+        const s = document.getElementById('status');
+        const b = document.getElementById('btn');
+        const bt = document.getElementById('btnText');
+
+        const historyModal = document.getElementById('historyModal');
+        const historyList = document.getElementById('historyList');
+
+        const mediaDesc = document.getElementById('mediaDesc');
+        const formatDesc = document.getElementById('formatDesc');
+
+        window.onload = () => urlInput.focus();
+
+        const escapeHtml = (value = '') => String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;'
+        }[ch]));
+
+        const escapeAttr = escapeHtml;
+
+        const copyTextSafe = async (text) => {
+            const value = String(text || '').trim();
+            if (!value) return false;
+
+            if (navigator.clipboard && window.isSecureContext) {
+                try {
+                    await navigator.clipboard.writeText(value);
+                    return true;
+                } catch (err) {
+                    // Fallback below.
+                }
+            }
+
+            try {
+                const ta = document.createElement('textarea');
+                ta.value = value;
+                ta.setAttribute('readonly', '');
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                ta.style.top = '0';
+                document.body.appendChild(ta);
+                ta.focus();
+                ta.select();
+
+                const ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+
+                if (ok) return true;
+            } catch (err) {
+                // Last fallback below.
+            }
+
+            window.prompt('Kopiera länken:', value);
+            return true;
+        };
+
+        const setCopyFeedback = (btnElem, ok = true) => {
+            const copyIcon = btnElem?.querySelector?.('.copy-icon');
+            const checkIcon = btnElem?.querySelector?.('.check-icon');
+
+            if (!copyIcon || !checkIcon) return;
+
+            copyIcon.classList.add('hidden');
+            checkIcon.classList.remove('hidden');
+            checkIcon.classList.toggle('text-emerald-400', ok);
+            checkIcon.classList.toggle('text-red-400', !ok);
+
+            setTimeout(() => {
+                checkIcon.classList.add('hidden');
+                copyIcon.classList.remove('hidden');
+                checkIcon.classList.remove('text-red-400');
+                checkIcon.classList.add('text-emerald-400');
+            }, 1500);
+        };
+
+        const updateFormatDesc = () => {
+            const mode = modeSelect.value;
+            const fmt = formatSelect.value;
+
+            if (mode === 'audio') {
+                mediaDesc.innerText = "Hämtar bara ljudet från länken. Bäst för radio, podd, intervjuer och klipp där bilden inte behövs.";
+
+                if (fmt === 'auto') {
+                    formatDesc.innerText = "Auto väljer bästa ljudkälla och konverterar bara när det behövs.";
+                } else {
+                    formatDesc.innerText = "WAV ger en Pro Tools-vänlig fil, säkrast för vidare ljudjobb.";
+                }
+            } else {
+                mediaDesc.innerText = "Hämtar video med ljud från länken. Använd när bilden ska sparas tillsammans med ljudet.";
+
+                if (fmt === 'auto') {
+                    formatDesc.innerText = "Auto försöker behålla bästa tillgängliga videokvalitet.";
+                } else {
+                    formatDesc.innerText = "MP4 försöker ge en mer kompatibel videofil för uppspelning och delning.";
+                }
+            }
+        };
+
+        const updateFormats = () => {
+            if (modeSelect.value === 'video') {
+                formatSelect.innerHTML = `<option value="auto" selected>Auto</option>
+                                          <option value="mp4">H.264 (MP4)</option>`;
+            } else {
+                formatSelect.innerHTML = `<option value="auto" selected>Auto</option>
+                                          <option value="wav">WAV</option>`;
+            }
+            updateFormatDesc();
+        };
+
+        formatSelect.addEventListener('change', updateFormatDesc);
+        modeSelect.onchange = updateFormats;
+        updateFormats();
+
+        urlInput.addEventListener('input', () => {
+            if (urlInput.value.length > 0) {
+                clearBtn.classList.remove('hidden');
+            } else {
+                clearBtn.classList.add('hidden');
+            }
+        });
+
+        clearBtn.onclick = () => {
+            if (b.disabled) return;
+            urlInput.value = '';
+            clearBtn.classList.add('hidden');
+            urlInput.focus();
+        };
+
+        window.resetUI = () => {
+            s.classList.add('hidden');
+            f.classList.remove('hidden');
+            f.reset();
+            clearBtn.classList.add('hidden');
+            updateFormats();
+            urlInput.focus();
+        };
+
+        window.openHistory = async () => {
+            historyModal.classList.remove('hidden');
+            historyModal.classList.add('flex');
+            historyList.innerHTML = '<div class="text-center text-slate-500 text-[10px] uppercase tracking-widest py-10 animate-pulse">Laddar historik...</div>';
+
+            try {
+                const res = await fetch('/api/history');
+                const data = await res.json();
+
+                if (!data || data.length === 0) {
+                    historyList.innerHTML = '<div class="text-center text-slate-600 text-[11px] font-mono italic py-10">Inga tidigare hämtningar sparade ännu.</div>';
+                    return;
+                }
+
+                historyList.innerHTML = data.map(item => {
+                    const d = new Date((item.ts || 0) * 1000);
+                    const dateStr = d.toLocaleDateString('sv-SE', { month: 'short', day: 'numeric' }) + ' ' +
+                                    d.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+
+                    const rawUrl = item.url || '';
+                    const safeUrl = escapeAttr(rawUrl);
+                    const displayUrl = escapeHtml(rawUrl);
+
+                    const rawTitle = item.title || rawUrl || 'Utan titel';
+                    const safeTitle = escapeAttr(rawTitle);
+                    const displayTitle = escapeHtml(rawTitle);
+
+                    const isVideo = item.mode === 'video';
+                    const iconColor = isVideo ? 'text-blue-400' : 'text-emerald-400';
+                    const modeText = isVideo ? 'VIDEO' : 'LJUD';
+
+                    const safeFormat = escapeHtml(item.format || '');
+
+                    const status = item.status || 'success';
+                    let statusBadge = '';
+                    if (status === 'processing') {
+                        statusBadge = '<span class="flex items-center gap-1 px-1.5 py-0.5 rounded bg-blue-500/10 border border-blue-500/20 text-blue-400"><span class="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse"></span>BEARBETAR</span>';
+                    } else if (status === 'error') {
+                        statusBadge = '<span class="flex items-center gap-1 px-1.5 py-0.5 rounded bg-red-500/10 border border-red-500/20 text-red-400"><span class="w-1.5 h-1.5 rounded-full bg-red-400"></span>MISSLYCKADES</span>';
+                    } else {
+                        statusBadge = '<span class="flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-400"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>KLAR</span>';
+                    }
+
+                    return `
+                        <div class="bg-black/30 border border-white/[0.03] rounded-2xl p-4 flex flex-col gap-3 relative group hover:border-white/10 hover:bg-black/50 transition-all">
+                            <div class="flex justify-between items-start gap-4 overflow-hidden">
+                                <div class="flex flex-col overflow-hidden w-full">
+                                    <div class="truncate font-semibold text-white mb-1" title="${safeTitle}">
+                                        ${displayTitle}
+                                    </div>
+                                    <a href="${safeUrl}" target="_blank" class="history-url truncate text-xs text-gray-400 hover:text-emerald-400 focus:outline-none transition-colors" title="${safeUrl}">
+                                        ${displayUrl}
+                                    </a>
+                                </div>
+                                <button type="button" data-copy-url="${safeUrl}" class="history-copy-btn text-slate-500 hover:text-emerald-400 transition-colors shrink-0 p-2 -m-2 cursor-pointer touch-manipulation" title="Kopiera länk" aria-label="Kopiera länk">
+                                    <svg class="w-5 h-5 copy-icon pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                                    <svg class="w-5 h-5 check-icon hidden text-emerald-400 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                                </button>
+                            </div>
+                            <div class="flex items-center gap-3 text-[9px] font-black uppercase tracking-widest flex-wrap">
+                                ${statusBadge}
+                                <span class="text-slate-500">${dateStr}</span>
+                                <span class="text-slate-700">•</span>
+                                <span class="${iconColor}">${modeText}</span>
+                                <span class="text-slate-700">•</span>
+                                <span class="text-slate-400 border border-white/10 px-2 py-0.5 rounded shadow-sm">${safeFormat}</span>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            } catch (err) {
+                historyList.innerHTML = '<div class="text-center text-red-400 text-xs font-bold py-10 uppercase tracking-widest">Ett fel uppstod vid laddning</div>';
+            }
+        };
+
+        window.closeHistory = () => {
+            historyModal.classList.add('hidden');
+            historyModal.classList.remove('flex');
+        };
+
+        window.copyUrl = async (btnElem, url = '') => {
+            let text = String(url || '').trim();
+
+            if (!text && btnElem) {
+                text = String(btnElem.dataset?.copyUrl || '').trim();
+            }
+
+            if (!text && btnElem) {
+                const row = btnElem.closest('.group');
+                const link = row ? row.querySelector('.history-url[href]') : null;
+                text = link ? link.getAttribute('href') : '';
+            }
+
+            const ok = await copyTextSafe(text);
+            setCopyFeedback(btnElem, ok);
+            return ok;
+        };
+
+        historyList.addEventListener('click', async (e) => {
+            const btn = e.target.closest('.history-copy-btn[data-copy-url]');
+            if (!btn || !historyList.contains(btn)) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            await window.copyUrl(btn);
+        });
+
+        window.addEventListener('click', (e) => {
+            if (e.target === historyModal) {
+                closeHistory();
+            }
+        });
+
+        const pollJobStatus = async (jobId) => {
+            try {
+                const res = await fetch(`/status/${jobId}`);
+                const d = await res.json();
+
+                if (d.status === 'processing') {
+                    loadingText.innerText = "Bearbetar media i bakgrunden...";
+                    setTimeout(() => pollJobStatus(jobId), 3000);
+                } else if (d.status === 'success') {
+                    const safeFilename = escapeHtml(d.filename || '');
+                    const fn = safeFilename ? `<div class="mt-6 pt-4 border-t border-emerald-500/20"><span class="text-[9px] text-emerald-500/60 uppercase tracking-[0.3em] font-black">Sparad som:</span><br><span class="text-white font-medium text-xs mt-1.5 inline-block truncate max-w-full" title="${safeFilename}">📄 ${safeFilename}</span></div>` : '';
+                    showResult(true, "Hämtning Slutförd", `<span class="text-blue-200 font-bold">/Redaktioner/FUNKTIONSMAPPAR/yt-dlp${fn}</span>`);
+                } else {
+                    showResult(false, "Fel", d.message || 'Okänt fel');
+                }
+            } catch (err) {
+                showResult(false, "Anslutningsfel", "Kunde inte hämta status från servern.");
+            }
+        };
+
+        const showResult = (isSuccess, title, message) => {
+            f.classList.add('hidden');
+
+            if (isSuccess) {
+                s.innerHTML = `
+                    <div class="text-emerald-400 font-[900] uppercase text-sm tracking-[0.4em] mb-6">${escapeHtml(title)}</div>
+                    <div class="text-[11px] text-blue-300/80 font-mono italic uppercase tracking-widest leading-relaxed pt-6 border-t border-white/[0.05] bg-gradient-to-b from-transparent to-blue-900/20 rounded-b-[2rem] pb-4">
+                        Filen hittas på:<br>${message}
+                    </div>
+                    <button type="button" onclick="resetUI()" class="mt-8 w-full bg-white/[0.03] hover:bg-white/10 border border-white/[0.05] text-white font-[900] py-6 rounded-[2rem] transition-all uppercase text-[10px] tracking-[0.3em]">Gör en ny hämtning</button>
+                `;
+                s.className = "p-8 sm:p-10 rounded-[3rem] border bg-emerald-500/[0.02] border-emerald-500/10 block";
+            } else {
+                s.innerHTML = `
+                    <div class="text-red-400 font-[900] uppercase text-[11px] tracking-[0.2em] mb-8">${escapeHtml(message)}</div>
+                    <button type="button" onclick="resetUI()" class="w-full bg-white/[0.03] hover:bg-white/10 border border-white/[0.05] text-white font-[900] py-6 rounded-[2rem] transition-all uppercase text-[10px] tracking-[0.3em]">Försök igen</button>
+                `;
+                s.className = "p-8 sm:p-10 rounded-[3rem] border bg-red-500/[0.02] border-red-500/10 block";
+            }
+
+            s.classList.remove('hidden');
+
+            b.disabled = false;
+            bt.innerText = "STARTA HÄMTNING";
+            progressWrap.classList.add('hidden');
+            document.getElementById('spinner').classList.add('hidden');
+        };
+
+        f.onsubmit = async (e) => {
+            e.preventDefault();
+            b.disabled = true;
+            bt.innerText = "BEARBETAR...";
+            progressWrap.classList.remove('hidden');
+            document.getElementById('spinner').classList.remove('hidden');
+            loadingText.innerText = "Kommunicerar med servern...";
+
+            try {
+                const res = await fetch('/download', { method: 'POST', body: new FormData(f) });
+                const d = await res.json();
+
+                if (d.status === 'started') {
+                    pollJobStatus(d.job_id);
+                } else {
+                    showResult(false, "Fel", d.message || 'Okänt fel');
+                }
+            } catch (err) {
+                showResult(false, "Anslutningsfel", "Kontrollera VPN/DNS eller att tjänsten är igång.");
+            }
+        };
+    </script>
+</body>
+</html>
