@@ -1,0 +1,56 @@
+# yt-studio-fetcher
+# Version: 1.1.0
+# Uppdaterad: 2026-02-24
+# Changelog:
+# - Lade till YTDLP_COOKIES env (valfri cookie-fil via /app/state/cookies.txt)
+# - Lade till tmpfs för /tmp (bättre temp-hantering i container)
+# - Behåller shm_size=1gb och befintliga live-mounts/state-upplägg
+
+version: '3.8'
+
+services:
+  yt-fetcher:
+    build: .
+    container_name: yt-studio-fetcher
+    user: "1026:100"
+    group_add:
+      - "101"
+
+    # Viktigt för Chromium/Playwright + större HLS-jobb
+    shm_size: '1gb'
+
+    # Valfritt: cookie-fil för låsta/krångliga sajter
+    environment:
+      - YTDLP_COOKIES=/app/state/cookies.txt
+      - TZ=Europe/Stockholm
+    # Temp i RAM (snabbt + mindre skräp i image-lagret)
+    tmpfs:
+      - /tmp:size=512m
+
+    volumes:
+      - /volume1/docker/yt-studio-fetcher/downloads:/output
+
+      # Live-edit
+      - /volume1/docker/yt-studio-fetcher/main.py:/app/main.py
+      - /volume1/docker/yt-studio-fetcher/templates:/app/templates
+      - /volume1/docker/yt-studio-fetcher/entrypoint.sh:/app/entrypoint.sh
+
+      # Persist state (cookies, update stamp, etc)
+      - /volume1/docker/yt-studio-fetcher/state:/app/state
+
+    ports:
+      - "8055:8000"
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
