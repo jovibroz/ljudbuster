@@ -1,9 +1,17 @@
 # ===================================================
 # LJUDBUSTER - Redaktionsverktyg
-# Version: 1.8.9-dev av Johan Hörnqvist
+# Version: 1.8.17-dev av Johan Hörnqvist
 # Uppdaterad: 2026-04-28
 #
 # Changelog:
+# - SVT Title NEAR Resolver (1.8.17-dev): Matchar exakt livepost-rubrik mot närmaste play-knapp och sniffar media efter klick.
+# - SVT Final Playwright Override (1.8.16-dev): Sist-i-filen resolver som rankar rätt SVT-playknapp, läser scoped video[src], rensar consent-overlay och sniffar media efter klick.
+# - SVT Consent Clickfix (1.8.15-dev): Rensar SVT consent-overlay före rankad play-klick och faller tillbaka till JS-click.
+# - SVT Ranked Aria Sniper (1.8.14-dev): Fixar falskt HTML-window, rankar synliga play-knappar och sniffar media efter vald knapp.
+# - SVT Aria Scoped Sniper (1.8.13-dev): Matchar ?inlagg mot HTML-window/rubrik, klickar rätt synlig play-knapp och sniffar bara media efter klick.
+# - SVT Chromium Scoped Sniper (1.8.13-dev): Klickar exakt SVT-livepost i Chromium och sniffar bara scoped Ditto/Switcher/HLS från rätt inlägg.
+# - SVT Scoped HTML-window Resolver (1.8.12-dev): Läser manifest/video endast ur textfönster runt exakt ?inlagg-id och resolverar SVT switcher JSON före yt-dlp.
+# - SVT Switcher JSON Resolver (1.8.11-dev): Resolverar switcher.cdn.svt.se JSON till riktig svt-vod .m3u8 innan yt-dlp.
 # - SVT DOM-first Resolver (1.8.9-dev): Scope:ar SVT livepost mot exakt inläggs-id, läser video[src]/manifestUrl ur DOM och blockerar global fallback för att undvika fel video.
 # - SVT Scoped Livepost Fix (1.8.8-dev): Tog bort lokal urlparse/parse_qs-import som skuggade global import och kraschade scoped resolver.
 # - SVT Scoped-Only Livepost Resolver (1.8.7-dev): SVT ?inlagg= får bara hämta ström från exakt rätt renderad inläggscontainer.
@@ -37,7 +45,7 @@ import logging
 import threading
 import unicodedata
 
-APP_VERSION = "1.8.9-dev"
+APP_VERSION = "1.8.17-dev"
 
 OUTPUT_DIR = "/output"
 ALLOWED_MODES = {"audio", "video"}
@@ -883,439 +891,1081 @@ def _get_svt_direct_url(job_id: str, article_url: str) -> Optional[str]:
         logger.error(f"[{job_id}] SVT Apollo kraschade: {e}")
     return None
 
-def _resolve_manifests_via_playwright(job_id: str, article_url: str) -> List[str]:
+def _resolve_manifests_via_playwright_legacy_1812(job_id: str, article_url: str) -> List[str]:
+    """Playwright/sniper fallback.
+
+    Viktigt för SVT liveposts:
+    - Om URL har ?inlagg=<id> får vi aldrig globalt plocka första bästa video.
+    - Vi accepterar bara media som kan kopplas till exakt post-id:
+      1) video[src]/manifestUrl inne i exakt DOM-post
+      2) response/body/html-window där samma post-id finns nära manifestet
+      3) nätverkstrafik efter klick på play-knappen i exakt post
+    """
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
     except Exception as e:
         logger.info(f"[{job_id}] Resolver: playwright import fail: {e}")
         return []
 
-    parsed_article = urlparse(article_url)
-    query = parse_qs(parsed_article.query)
+    from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs, unquote as _unquote
+    import html as _html
+
+    parsed_article = _urlparse(article_url)
+    query = _parse_qs(parsed_article.query)
     inlagg_id = query.get("inlagg", [None])[0]
     is_svt_page = "svt.se" in (article_url or "").lower() or "svtplay.se" in (article_url or "").lower()
 
     found: List[str] = []
+    found_scoped: List[str] = []
+    click_armed = {"value": False}
 
     def _dedupe(items: List[str]) -> List[str]:
         seen = set()
         out: List[str] = []
         for item in items:
+            item = str(item or "").strip()
             if not item or item in seen:
                 continue
             seen.add(item)
             out.append(item)
         return out
 
-    def _unwrap_svt_manifest_urls(blob: str) -> List[str]:
-        if not blob:
+    def _decode_blob(blob: str) -> str:
+        s = str(blob or "")
+        for _ in range(3):
+            s = _html.unescape(s)
+            s = (
+                s.replace("\\/", "/")
+                 .replace("\\u0026", "&")
+                 .replace("\\u003d", "=")
+                 .replace("\\u003D", "=")
+                 .replace("\\u003c", "<")
+                 .replace("\\u003C", "<")
+                 .replace("\\u003e", ">")
+                 .replace("\\u003E", ">")
+                 .replace("\\u0022", '"')
+                 .replace("\\u0027", "'")
+                 .replace("&amp;", "&")
+            )
+        return s
+
+    def _is_svt_media_candidate(url: str) -> bool:
+        u = str(url or "").lower()
+        if not u or u.startswith("blob:"):
+            return False
+        return (
+            ".m3u8" in u
+            or "api.svt.se/ditto/api/v3/manifest" in u
+            or "switcher.cdn.svt.se/resolve/" in u
+            or "svt-vod-" in u
+            or ".cdn.svt.se/" in u
+            or "ed16.cdn.svt.se/" in u
+        )
+
+    def _normalize_candidate(url: str) -> List[str]:
+        url = _decode_blob(url).strip().strip('"').strip("'")
+        if not url or url.startswith("blob:"):
             return []
 
-        s = html_parser.unescape(str(blob)).replace("\\/", "/")
         out: List[str] = []
 
-        def push(u: str) -> None:
-            u = html_parser.unescape(str(u or "")).replace("\\/", "/").strip()
-            if not u or u.startswith("blob:"):
-                return
-            if u not in out:
-                out.append(u)
-
-        for api_url in re.findall(r"https?://api\.svt\.se/ditto/api/v3/manifest\?[^\"'<>\\s]+", s, flags=re.I):
+        # SVT Ditto wrapper:
+        # https://api.svt.se/ditto/api/v3/manifest?manifestUrl=<encoded real hls>&platform=...
+        if "api.svt.se/ditto/api/v3/manifest" in url.lower():
             try:
-                qs = parse_qs(urlparse(api_url).query)
-                for real_url in qs.get("manifestUrl", []):
-                    push(unquote(real_url))
+                qs = _parse_qs(_urlparse(url).query)
+                for wrapped in qs.get("manifestUrl", []):
+                    out.extend(_normalize_candidate(_unquote(wrapped)))
+            except Exception:
+                pass
+            return out
+
+        # Rå manifestUrl=... som kan ligga i HTML/Firestore/body.
+        if "manifestUrl=" in url:
+            try:
+                qs = _parse_qs(_urlparse(url).query)
+                for wrapped in qs.get("manifestUrl", []):
+                    out.extend(_normalize_candidate(_unquote(wrapped)))
             except Exception:
                 pass
 
-        for m in re.finditer(r"manifestUrl=([^&\"'<>\\s]+)", s, flags=re.I):
+        # SVT switcher svarar ibland JSON trots .m3u8-suffix.
+        if "switcher.cdn.svt.se/resolve/" in url.lower():
             try:
-                push(unquote(m.group(1)))
-            except Exception:
-                pass
+                if "_resolve_svt_switcher_if_needed" in globals():
+                    resolved = _resolve_svt_switcher_if_needed(job_id, url)
+                    if resolved and resolved != url:
+                        out.extend(_normalize_candidate(resolved))
+                        return _dedupe(out)
+            except Exception as e:
+                logger.info(f"[{job_id}] SVT Chromium sniper: switcher normalize fail: {e}")
 
-        for m in re.finditer(r'"manifestUrl"\s*:\s*"([^"]+)"', s, flags=re.I):
-            try:
-                push(unquote(m.group(1)))
-            except Exception:
-                pass
-
-        for u in re.findall(r"https?://(?:svt-vod-[^\"'<>\\s]+|switcher\.cdn\.svt\.se/resolve/[^\"'<>\\s]+)", s, flags=re.I):
-            push(u)
+        if _is_svt_media_candidate(url):
+            out.append(url)
 
         return _dedupe(out)
 
-    def _is_candidate_url(u: str) -> bool:
-        ul = (u or "").lower()
-        if not ul or ul.startswith("blob:"):
-            return False
-        if "api.svt.se/ditto/api/v3/manifest" in ul:
-            return False
-        if any(bad in ul for bad in ["adserver", "freewheel", "videoplaza", "doubleclick", "scorecardresearch", "imrworldwide"]):
-            return False
-        if any(ext in ul for ext in [".m3u8", ".mpd", ".mp4", ".m4a", ".mp3"]):
-            return True
-        if any(domain in ul for domain in ["switcher.cdn.svt.se/resolve/", "trailers.filmstaden.se", "player.vimeo.com/video/", "youtube.com/embed/", "youtube-nocookie.com/embed/", "youtube.com/watch", "youtu.be/"]):
-            return True
-        return False
+    def _extract_candidates_from_text(blob: str) -> List[str]:
+        s = _decode_blob(blob)
+        out: List[str] = []
 
-    def _add_to(pool: List[str], u: str) -> None:
-        if not u:
-            return
+        patterns = [
+            r'https?://api\.svt\.se/ditto/api/v3/manifest\?[^"\'<>\s\\]+',
+            r'https?://switcher\.cdn\.svt\.se/resolve/[^"\'<>\s\\]+',
+            r'https?://[^"\'<>\s\\]+\.m3u8[^"\'<>\s\\]*',
+            r'manifestUrl=([^"\'<>\s\\]+)',
+            r'"manifestUrl"\s*:\s*"([^"]+)"',
+            r"'manifestUrl'\s*:\s*'([^']+)'",
+            r'src\s*=\s*"([^"]+\.m3u8[^"]*)"',
+            r"src\s*=\s*'([^']+\.m3u8[^']*)'",
+        ]
 
-        raw = html_parser.unescape(str(u)).replace("\\/", "/").strip()
-        if not raw or raw.startswith("blob:"):
-            return
+        for pat in patterns:
+            for m in re.finditer(pat, s, flags=re.I):
+                raw = m.group(1) if m.lastindex else m.group(0)
+                out.extend(_normalize_candidate(raw))
 
-        if "api.svt.se/ditto/api/v3/manifest" in raw:
-            for real_url in _unwrap_svt_manifest_urls(raw):
-                _add_to(pool, real_url)
-            return
+        return _dedupe(out)
 
-        m = re.search(r"https://switcher\.cdn\.svt\.se/resolve/([0-9a-fA-F-]{36})/", raw)
-        if m:
-            uuid_val = m.group(1)
-            hls_full = f"https://switcher.cdn.svt.se/resolve/{uuid_val}/hls-cmaf-full.m3u8"
-            if hls_full not in pool:
-                pool.append(hls_full)
+    def _extract_scoped_window(blob: str, marker: str, before: int = 12000, after: int = 24000) -> str:
+        s = _decode_blob(blob)
+        if not marker or marker not in s:
+            return ""
+        idx = s.find(marker)
+        start = max(0, idx - before)
+        end = min(len(s), idx + after)
+        return s[start:end]
 
-        if _is_candidate_url(raw) and raw not in pool:
-            pool.append(raw)
+    def _add_global_candidate(url: str, source: str) -> None:
+        for u in _normalize_candidate(url):
+            if u not in found:
+                found.append(u)
+                logger.info(f"[{job_id}] Snipern fångade SVT-kandidat ({source}): {u}")
 
-        for real_url in _unwrap_svt_manifest_urls(raw):
-            if real_url not in pool:
-                pool.append(real_url)
+    def _add_scoped_candidate(url: str, source: str) -> None:
+        for u in _normalize_candidate(url):
+            if u not in found_scoped:
+                found_scoped.append(u)
+                logger.info(f"[{job_id}] SVT scoped sniper fångade kandidat ({source}): {u}")
 
-    def _add(u: str) -> None:
-        _add_to(found, u)
-
-    def _extract_scoped_svt_dom(page, post_id: str) -> Dict[str, Any]:
-        return page.evaluate(
-            """
-            (postId) => {
-                const out = {
-                    readyState: document.readyState,
-                    htmlHasId: document.documentElement.innerHTML.includes(postId),
-                    container: false,
-                    videoSrcs: [],
-                    urls: [],
-                    buttonLabels: [],
-                    textSample: ""
-                };
-
-                const node = document.getElementById(postId);
-                if (!node) return out;
-
-                out.container = true;
-                out.textSample = (node.innerText || "").slice(0, 500);
-
-                for (const video of Array.from(node.querySelectorAll("video"))) {
-                    out.videoSrcs.push(video.currentSrc || video.src || video.getAttribute("src") || "");
-                }
-
-                for (const btn of Array.from(node.querySelectorAll("button"))) {
-                    out.buttonLabels.push(btn.getAttribute("aria-label") || btn.getAttribute("data-rt") || btn.innerText || "");
-                }
-
-                const html = node.innerHTML || "";
-                out.urls = html.match(/https?:\\/\\/[^"'<>\\s)]+/g) || [];
-                return out;
-            }
-            """,
-            post_id,
-        )
-
-    def _extract_scoped_candidates(page, post_id: str, label: str) -> Tuple[List[str], Dict[str, Any]]:
-        scoped: List[str] = []
-        info: Dict[str, Any] = {}
+    def _inspect_scoped_dom(page, label: str) -> List[str]:
+        if not inlagg_id:
+            return []
 
         try:
-            info = _extract_scoped_svt_dom(page, post_id)
+            data = page.evaluate(
+                """
+                (id) => {
+                  const post =
+                    document.getElementById(id) ||
+                    Array.from(document.querySelectorAll('[id]')).find(el => el.id === id);
+
+                  const html = post ? post.outerHTML : "";
+                  const docHtml = document.documentElement ? document.documentElement.innerHTML : "";
+
+                  return {
+                    hasPost: !!post,
+                    docHasId: docHtml.includes(id),
+                    postHtml: html,
+                    postText: post ? (post.innerText || "") : "",
+                    videoSrcs: post ? Array.from(post.querySelectorAll("video")).map(v => v.currentSrc || v.src || v.getAttribute("src") || "").filter(Boolean) : [],
+                    buttons: post ? Array.from(post.querySelectorAll("button")).map(b => ({
+                      text: b.innerText || "",
+                      aria: b.getAttribute("aria-label") || "",
+                      testid: b.getAttribute("data-testid") || "",
+                      rt: b.getAttribute("data-rt") || ""
+                    })).slice(0, 20) : []
+                  };
+                }
+                """,
+                inlagg_id,
+            )
         except Exception as e:
-            logger.info(f"[{job_id}] SVT DOM-first: evaluate misslyckades ({label}): {e}")
-            return [], {}
+            logger.info(f"[{job_id}] SVT scoped DOM ({label}) evaluate fail: {e}")
+            return []
+
+        has_post = bool(data.get("hasPost"))
+        doc_has_id = bool(data.get("docHasId"))
+        video_srcs = data.get("videoSrcs") or []
+        buttons = data.get("buttons") or []
+        post_html = data.get("postHtml") or ""
 
         logger.info(
-            f"[{job_id}] SVT DOM-first ({label}): "
-            f"container={info.get('container')} "
-            f"htmlHasId={info.get('htmlHasId')} "
-            f"videos={len(info.get('videoSrcs') or [])} "
-            f"urls={len(info.get('urls') or [])} "
-            f"buttons={len(info.get('buttonLabels') or [])}"
+            f"[{job_id}] SVT scoped DOM ({label}): "
+            f"post={has_post} docHasId={doc_has_id} videos={len(video_srcs)} buttons={len(buttons)}"
         )
 
-        for src in info.get("videoSrcs") or []:
-            _add_to(scoped, src)
+        out: List[str] = []
+        for src in video_srcs:
+            out.extend(_normalize_candidate(src))
+        out.extend(_extract_candidates_from_text(post_html))
 
-        for u in info.get("urls") or []:
-            _add_to(scoped, u)
+        for u in _dedupe(out):
+            _add_scoped_candidate(u, f"dom:{label}")
 
-        scoped = _dedupe(scoped)
-        if scoped:
-            logger.info(f"[{job_id}] SVT DOM-first ({label}): kandidater={len(scoped)} första={scoped[0]}")
+        return _dedupe(out)
 
-        return scoped, info
+    def _click_exact_post(page) -> str:
+        if not inlagg_id:
+            return "no-inlagg-id"
 
-    def _click_scoped_svt_play(page, post_id: str) -> str:
         try:
             return page.evaluate(
                 """
-                (postId) => {
-                    const node = document.getElementById(postId);
-                    if (!node) return "no-container";
+                async (id) => {
+                  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-                    const selectors = [
-                        '[data-testid="play-pause-button"]',
-                        'button[data-rt="video-player-splash-play"]',
-                        'button[aria-label*="Spela"]',
-                        'button[title*="Spela"]',
-                        'video'
-                    ];
+                  const findPost = () =>
+                    document.getElementById(id) ||
+                    Array.from(document.querySelectorAll('[id]')).find(el => el.id === id);
 
-                    for (const sel of selectors) {
-                        const el = node.querySelector(sel);
-                        if (!el) continue;
+                  // Försök få SVT att rendera/expandera liveflödet.
+                  for (let round = 0; round < 8; round++) {
+                    const post = findPost();
+                    if (post) break;
 
-                        el.scrollIntoView({block: "center", inline: "center"});
+                    window.scrollTo(0, Math.floor(document.body.scrollHeight * (round / 8)));
 
-                        if (el.tagName && el.tagName.toLowerCase() === "video") {
-                            try {
-                                el.play();
-                                return "video-play-called";
-                            } catch (e) {
-                                return "video-play-failed";
-                            }
-                        }
+                    const expanders = Array.from(document.querySelectorAll('button')).filter(b => {
+                      const t = (b.innerText || "").toLowerCase();
+                      const a = (b.getAttribute("aria-label") || "").toLowerCase();
+                      return (
+                        t.includes("fler händelser") ||
+                        t.includes("visa inlägg") ||
+                        a.includes("visa inlägget") ||
+                        a.includes("visa inlägg")
+                      );
+                    });
 
-                        try {
-                            el.click();
-                            return "clicked:" + sel;
-                        } catch (e) {
-                            return "click-failed:" + sel;
-                        }
+                    for (const b of expanders.slice(0, 8)) {
+                      try {
+                        b.scrollIntoView({block: "center", inline: "center"});
+                        b.click();
+                        await sleep(250);
+                      } catch (e) {}
                     }
 
-                    return "no-button";
+                    await sleep(500);
+                  }
+
+                  const post = findPost();
+                  if (!post) return "no-post";
+
+                  post.scrollIntoView({block: "center", inline: "center"});
+                  await sleep(300);
+
+                  const selectors = [
+                    'button[data-testid="play-pause-button"]',
+                    'button[data-rt="video-player-splash-play"]',
+                    '[data-rt="video-player-splash-play"]',
+                    'button[aria-label*="Spela"]',
+                    'video'
+                  ];
+
+                  for (const sel of selectors) {
+                    const el = post.querySelector(sel);
+                    if (el) {
+                      try {
+                        el.scrollIntoView({block: "center", inline: "center"});
+                        await sleep(200);
+                        el.click();
+                        return "clicked:" + sel;
+                      } catch (e) {
+                        return "click-error:" + sel + ":" + String(e);
+                      }
+                    }
+                  }
+
+                  return "no-play-control";
                 }
                 """,
-                post_id,
+                inlagg_id,
             )
         except Exception as e:
-            return f"exception:{e}"
+            return f"evaluate-error:{e}"
+
+    def _try_scoped_html_body(page, label: str) -> List[str]:
+        if not inlagg_id:
+            return []
+
+        out: List[str] = []
+
+        try:
+            content = page.content()
+            window = _extract_scoped_window(content, inlagg_id)
+            if window:
+                html_hits = _extract_candidates_from_text(window)
+                logger.info(f"[{job_id}] SVT scoped HTML-window ({label}): hits={len(html_hits)}")
+                for u in html_hits:
+                    _add_scoped_candidate(u, f"html-window:{label}")
+                out.extend(html_hits)
+            else:
+                logger.info(f"[{job_id}] SVT scoped HTML-window ({label}): inget id-window")
+        except Exception as e:
+            logger.info(f"[{job_id}] SVT scoped HTML-window ({label}) fail: {e}")
+
+        return _dedupe(out)
 
     try:
-        with sync_playwright() as p:
-            b = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            ctx = b.new_context(
-                user_agent=_AB_UA,
-                viewport={"width": 1440, "height": 1600},
-                extra_http_headers={"Accept-Language": "sv-SE,sv;q=0.9,en-US;q=0.8,en;q=0.7"},
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--autoplay-policy=no-user-gesture-required",
+                ],
             )
-            page = ctx.new_page()
+
+            context = browser.new_context(
+                viewport={"width": 1440, "height": 1400},
+                locale="sv-SE",
+                timezone_id="Europe/Stockholm",
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/142.0.0.0 Safari/537.36"
+                ),
+                extra_http_headers={
+                    "Accept-Language": "sv-SE,sv;q=0.9,en;q=0.8",
+                },
+            )
+
+            page = context.new_page()
 
             def on_request(req):
-                try:
-                    req_url = req.url
+                u = req.url
+                if not _is_svt_media_candidate(u):
+                    return
+                if is_svt_page and inlagg_id:
+                    if click_armed["value"]:
+                        _add_scoped_candidate(u, "request-after-click")
+                    else:
+                        _add_global_candidate(u, "request-before-scope")
+                else:
+                    _add_global_candidate(u, "request")
 
-                    if "api.svt.se/ditto/api/v3/manifest" in req_url:
-                        for real_url in _unwrap_svt_manifest_urls(req_url):
-                            _add(real_url)
+            def on_response(resp):
+                u = resp.url
 
-                    if "switcher.cdn.svt.se/resolve/" in req_url:
-                        _add(req_url)
+                if _is_svt_media_candidate(u):
+                    if is_svt_page and inlagg_id:
+                        if click_armed["value"]:
+                            _add_scoped_candidate(u, "response-after-click")
+                        else:
+                            _add_global_candidate(u, "response-before-scope")
+                    else:
+                        _add_global_candidate(u, "response")
 
-                    if _is_candidate_url(req_url):
-                        for media_u in _extract_media_urls_from_text(req_url):
-                            _add(media_u)
-                        _add(req_url)
+                # Viktigt: Firestore/live/API-responsen kan innehålla själva post-blocket
+                # även när document.getElementById(id) ännu inte finns.
+                if is_svt_page and inlagg_id:
+                    lu = u.lower()
+                    interesting_body = (
+                        "firestore.googleapis.com" in lu
+                        or "direktcenter" in lu
+                        or "svt.se" in lu
+                        or "api.svt.se" in lu
+                    )
 
-                    if "svt-vod-" in req_url and "akamaized.net" in req_url:
-                        if ".m3u8" in req_url or ".mpd" in req_url:
-                            logger.info(f"[{job_id}] [FISKENÄTET] Hittade SVT manifest: {req_url}")
-                            _add(req_url)
-                        elif "cmaf" in req_url and "init.mp4" in req_url:
-                            base_match = re.match(r"(https://svt-vod-[a-zA-Z0-9.-]+/.*?[0-9a-fA-F-]{36}/)", req_url)
-                            if base_match:
-                                guessed = base_match.group(1) + "hls-cmaf-full.m3u8"
-                                logger.info(f"[{job_id}] [FISKENÄTET] Rekonstruerad SVT manifest-länk: {guessed}")
-                                _add(guessed)
-                except Exception:
-                    pass
+                    if interesting_body:
+                        try:
+                            body = resp.text(timeout=3000)
+                        except TypeError:
+                            try:
+                                body = resp.text()
+                            except Exception:
+                                body = ""
+                        except Exception:
+                            body = ""
 
-            def on_response(res):
-                try:
-                    res_url = res.url
-
-                    if "playback2.a2d.tv/play/" in res_url:
-                        data = res.json()
-                        if "playbackItem" in data:
-                            m = data["playbackItem"].get("manifestUrl") or data["playbackItem"].get("accessUrl")
-                            if m:
-                                _add(m)
-
-                    if "video.svt.se/video/" in res_url:
-                        logger.info(f"[{job_id}] Snipern fångade SVT API-anrop!")
-                        data = res.json()
-                        if "videoReferences" in data:
-                            for ref in data["videoReferences"]:
-                                u = ref.get("url") or ref.get("resolve") or ref.get("redirect")
-                                if u:
-                                    _add(u)
-
-                    content_type = res.headers.get("content-type", "")
-                    if "application/json" in content_type:
-                        body = res.text()
-                        for media_u in _extract_media_urls_from_text(body):
-                            _add(media_u)
-                        for real_url in _unwrap_svt_manifest_urls(body):
-                            _add(real_url)
-                except Exception:
-                    pass
+                        if body and inlagg_id in _decode_blob(body):
+                            scoped = _extract_scoped_window(body, inlagg_id)
+                            hits = _extract_candidates_from_text(scoped)
+                            logger.info(
+                                f"[{job_id}] SVT scoped response-body: "
+                                f"url={u[:120]} hits={len(hits)}"
+                            )
+                            for hit in hits:
+                                _add_scoped_candidate(hit, "response-body-near-id")
 
             page.on("request", on_request)
             page.on("response", on_response)
 
             logger.info(f"[{job_id}] Playwright-fiskenät aktiverat! Skrapar {article_url}...")
 
-            try:
-                page.goto(article_url, wait_until="domcontentloaded", timeout=25_000)
-            except Exception as e:
-                logger.info(f"[{job_id}] Playwright goto varnade: {e}")
+            page.goto(article_url, wait_until="domcontentloaded", timeout=30000)
 
             try:
-                page.wait_for_load_state("networkidle", timeout=8_000)
+                page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 pass
 
             if is_svt_page and inlagg_id:
-                logger.info(f"[{job_id}] SVT DOM-first: söker exakt inlägg [id=\"{inlagg_id}\"]")
+                logger.info(f"[{job_id}] SVT Chromium scoped sniper: target inlägg={inlagg_id}")
 
-                for attempt in range(1, 7):
-                    scoped, info = _extract_scoped_candidates(page, inlagg_id, f"attempt-{attempt}")
-                    if scoped:
-                        ctx.close()
-                        b.close()
-                        return scoped
-
-                    if info.get("container"):
+                # Först: se om Firestore/API redan gav oss exakt post.
+                for _ in range(10):
+                    if found_scoped:
                         break
+                    _try_scoped_html_body(page, "before-click")
+                    _inspect_scoped_dom(page, "before-click")
+                    if found_scoped:
+                        break
+                    page.wait_for_timeout(1000)
 
-                    try:
-                        page.evaluate("window.scrollBy(0, Math.max(window.innerHeight, 900));")
-                    except Exception:
-                        pass
+                if not found_scoped:
+                    click_result = _click_exact_post(page)
+                    logger.info(f"[{job_id}] SVT Chromium scoped sniper: klickresultat={click_result}")
 
-                    for sel in [
-                        'button:has-text("Fler händelser")',
-                        'button:has-text("Visa fler")',
-                        'button:has-text("Visa inlägget")',
-                        'button[aria-label*="Visa inlägget"]',
-                    ]:
-                        try:
-                            page.click(sel, timeout=900)
-                            page.wait_for_timeout(700)
+                    click_armed["value"] = True
+
+                    # Direkt efter klick: DOM och nätverk får några sekunder på sig.
+                    for i in range(16):
+                        if found_scoped:
                             break
-                        except Exception:
-                            pass
+                        _inspect_scoped_dom(page, f"after-click-{i+1}")
+                        _try_scoped_html_body(page, f"after-click-{i+1}")
+                        if found_scoped:
+                            break
+                        page.wait_for_timeout(750)
 
-                    page.wait_for_timeout(900)
+                browser.close()
 
-                found.clear()
-                click_result = _click_scoped_svt_play(page, inlagg_id)
-                logger.info(f"[{job_id}] SVT DOM-first: scoped klickresultat: {click_result}")
+                scoped_final = _dedupe(found_scoped)
+                if scoped_final:
+                    logger.info(f"[{job_id}] SVT Chromium scoped sniper: returnerar {len(scoped_final)} scoped kandidat(er), första={scoped_final[0]}")
+                    return scoped_final
 
-                for i in range(1, 12):
-                    page.wait_for_timeout(700)
-                    scoped, info = _extract_scoped_candidates(page, inlagg_id, f"after-click-{i}")
-                    if scoped:
-                        ctx.close()
-                        b.close()
-                        return scoped
-
-                    if found and click_result.startswith(("clicked:", "video-play-called")):
-                        logger.info(f"[{job_id}] SVT DOM-first: scoped klick gav nätverkskandidater={len(found)} första={found[0]}")
-                        ctx.close()
-                        b.close()
-                        return _dedupe(found)
-
-                logger.info(f"[{job_id}] SVT DOM-first: ingen scoped stream hittades. Avbryter utan global fallback för att undvika fel video.")
-                ctx.close()
-                b.close()
+                logger.info(f"[{job_id}] SVT Chromium scoped sniper: ingen video kunde kopplas till exakt SVT-inlägg. Global fallback blockerad.")
                 return []
 
+            # Generic fallback för vanliga artiklar / icke-SVT / SVT utan ?inlagg=.
+            page.wait_for_timeout(3000)
+
             try:
-                page_html = page.content()
-                for media_u in _extract_media_urls_from_text(page_html):
-                    _add(media_u)
-                for real_url in _unwrap_svt_manifest_urls(page_html):
-                    _add(real_url)
+                # Klicka första synliga play-knapp som generisk fallback.
+                page.evaluate(
+                    """
+                    async () => {
+                      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+                      const buttons = Array.from(document.querySelectorAll(
+                        'button[data-testid="play-pause-button"], button[data-rt="video-player-splash-play"], button[aria-label*="Spela"]'
+                      ));
+                      for (const b of buttons.slice(0, 3)) {
+                        try {
+                          b.scrollIntoView({block: "center", inline: "center"});
+                          await sleep(200);
+                          b.click();
+                          await sleep(1000);
+                          return true;
+                        } catch (e) {}
+                      }
+                      return false;
+                    }
+                    """
+                )
             except Exception:
                 pass
 
-            for _ in range(16):
-                if found:
-                    logger.info(f"[{job_id}] Fiskenätet fångade direktlänk, avbryter sidladdning!")
-                    ctx.close()
-                    b.close()
-                    return _dedupe(found)
-                page.wait_for_timeout(500)
+            page.wait_for_timeout(8000)
+            browser.close()
 
-            for sel in [
-                'button:has-text("Godkänn alla cookies")',
-                'button:has-text("Godkänn")',
-                'button:has-text("Okej")',
-                'button:has-text("Acceptera")',
-                'button:has-text("Tillåt alla")',
-            ]:
-                try:
-                    page.click(sel, timeout=1000)
-                    break
-                except Exception:
-                    pass
+            final = _dedupe(found)
+            if final:
+                logger.info(f"[{job_id}] Fiskenätet fångade ström efter klick! Första={final[0]}")
+            else:
+                logger.info(f"[{job_id}] Fiskenätet drogs upp tomt.")
 
-            for frame in [page] + page.frames:
-                for sel in [
-                    'button:has-text("Trailer")',
-                    'button[aria-label*="Trailer"]',
-                    'a:has-text("Trailer")',
-                    'div:has-text("Spela trailer")',
-                    '.play-icon',
-                    ".jw-video",
-                    'button:has-text("Spela")',
-                    'button[aria-label*="Spela"]',
-                    'button[title*="Spela"]',
-                    ".vgtv-player",
-                    "video",
-                    ".vjs-big-play-button",
-                    'button[class*="play-button"]',
-                    'button[class*="PlayButton"]',
-                    '[data-testid="play-pause-button"]',
-                    'button[data-rt="video-player-splash-play"]',
-                ]:
-                    try:
-                        frame.click(sel, timeout=1000)
-                    except Exception:
-                        pass
-
-            for _ in range(15):
-                if found:
-                    logger.info(f"[{job_id}] Fiskenätet fångade ström efter klick!")
-                    break
-                page.wait_for_timeout(1000)
-
-            ctx.close()
-            b.close()
+            return final
 
     except Exception as e:
-        logger.info(f"[{job_id}] Fiskenätet (Playwright) stötte på ett problem: {e}")
-
-    return _dedupe(found)
-
+        logger.info(f"[{job_id}] Playwright resolver fel: {e}")
+        return []
 
 def _is_direct_media(url: str) -> bool:
     ul = (url or "").lower()
     return (".m3u8" in ul) or ul.endswith(".mpd") or ul.endswith(".mp4") or ul.endswith(".m4a") or ul.endswith(".mp3")
+
+
+def _extract_svt_scoped_media_urls_from_blob(job_id: str, blob: str, inlagg_id: str) -> List[str]:
+    """Extraherar SVT-media endast nära exakt livepost-id.
+
+    Detta är avsiktligt smalare än globalt fiskenät:
+    - URL måste ha ?inlagg=<id>
+    - vi letar bara i HTML/text nära just det id:t
+    - vi unwrap:ar api.svt.se/ditto manifestUrl
+    - vi resolverar switcher.cdn.svt.se JSON om helpern finns
+    """
+    if not blob or not inlagg_id:
+        return []
+
+    raw = html_parser.unescape(str(blob)).replace("\\/", "/")
+    low = raw.lower()
+    needle = inlagg_id.lower()
+
+    if needle not in low:
+        return []
+
+    chunks: List[str] = []
+    pos = 0
+
+    while True:
+        idx = low.find(needle, pos)
+        if idx < 0:
+            break
+
+        # Försök börja vid närmaste <div före id:t.
+        div_start = low.rfind("<div", 0, idx)
+        if div_start >= 0 and (idx - div_start) < 3000:
+            start = div_start
+        else:
+            start = max(0, idx - 5000)
+
+        max_end = min(len(raw), idx + 220000)
+
+        # Sluta helst innan nästa post-id, för att inte råka ta grannvideo.
+        next_post = re.search(
+            r'<div\s+id=["\'][0-9a-f]{24,40}["\']',
+            low[idx + len(needle):max_end],
+            flags=re.I,
+        )
+
+        if next_post:
+            end = idx + len(needle) + next_post.start()
+        else:
+            end = max_end
+            for marker in ("</li>", "<li><button", "</article>"):
+                marker_pos = low.find(marker, idx + len(needle), max_end)
+                if marker_pos != -1:
+                    end = min(end, marker_pos)
+
+        chunk = raw[start:end]
+        if chunk:
+            chunks.append(chunk)
+
+        pos = idx + len(needle)
+
+    candidates: List[str] = []
+
+    def push(value: str) -> None:
+        u = html_parser.unescape(str(value or "")).replace("\\/", "/").strip()
+        if not u or u.startswith("blob:"):
+            return
+
+        if u.startswith("//"):
+            u = "https:" + u
+
+        if "api.svt.se/ditto/api/v3/manifest" in u.lower():
+            try:
+                qs = parse_qs(urlparse(u).query)
+                for wrapped in qs.get("manifestUrl", []):
+                    push(unquote(wrapped))
+            except Exception:
+                pass
+            return
+
+        if not (u.startswith("http://") or u.startswith("https://")):
+            return
+
+        ul = u.lower()
+        if (
+            ".m3u8" in ul
+            or ".mpd" in ul
+            or "switcher.cdn.svt.se/resolve/" in ul
+            or "svt-vod-" in ul
+            or ".cdn.svt.se/" in ul
+        ):
+            candidates.append(u)
+
+    for chunk in chunks:
+        # 1) video[src] inne i rätt block.
+        for tag in re.findall(r"<video\b[^>]*>", chunk, flags=re.I | re.S):
+            for m in re.finditer(r'\bsrc=["\']([^"\']+)["\']', tag, flags=re.I):
+                push(m.group(1))
+
+        # 2) Full api.svt.se/ditto wrapper.
+        for m in re.findall(
+            r'https?://api\.svt\.se/ditto/api/v3/manifest\?[^"\'<>\s]+',
+            chunk,
+            flags=re.I,
+        ):
+            push(m)
+
+        # 3) Rå manifestUrl=...
+        for m in re.finditer(r'manifestUrl=([^&"\'<>\s]+)', chunk, flags=re.I):
+            push(unquote(m.group(1)))
+
+        # 4) JSON-liknande manifestUrl.
+        for m in re.finditer(r'"manifestUrl"\s*:\s*"([^"]+)"', chunk, flags=re.I):
+            push(m.group(1))
+
+        # 5) Direkta SVT/Switcher HLS-länkar.
+        for m in re.findall(r'https?://[^"\'<>\s]+\.m3u8(?:\?[^"\'<>\s]*)?', chunk, flags=re.I):
+            push(m)
+
+    # Dedupe + resolvera switcher-JSON.
+    seen = set()
+    resolved: List[str] = []
+
+    for u in candidates:
+        try:
+            if "switcher.cdn.svt.se/resolve/" in u.lower() and "_resolve_svt_switcher_if_needed" in globals():
+                u = _resolve_svt_switcher_if_needed(job_id, u)
+        except Exception:
+            pass
+
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        resolved.append(u)
+
+    if resolved:
+        logger.info(
+            f"[{job_id}] SVT scoped HTML-window: id={inlagg_id} chunks={len(chunks)} kandidater={len(resolved)} första={resolved[0]}"
+        )
+    else:
+        logger.info(
+            f"[{job_id}] SVT scoped HTML-window: id={inlagg_id} chunks={len(chunks)} men inga mediakandidater"
+        )
+
+    return resolved
+
+
+
+# === LjudBuster 1.8.13-dev: SVT aria-correlated scoped sniper ===
+
+def _lb_svt_norm_text(value: str) -> str:
+    value = html_parser.unescape(str(value or ""))
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _lb_svt_looks_like_media_url(url: str) -> bool:
+    lower = str(url or "").lower()
+
+    if not lower.startswith("http"):
+        return False
+
+    if "__manifest" in lower:
+        return False
+
+    if "/assets/manifest-" in lower:
+        return False
+
+    if "firestore.googleapis.com" in lower:
+        return False
+
+    return (
+        "api.svt.se/ditto/api/v3/manifest" in lower
+        or "switcher.cdn.svt.se/resolve/" in lower
+        or ".m3u8" in lower
+        or ".mpd" in lower
+        or "svt-vod" in lower
+        or re.search(r"https://ed[0-9]+\.cdn\.svt\.se/", lower) is not None
+    )
+
+
+def _lb_svt_push_candidate(out: List[str], url: str) -> None:
+    url = html_parser.unescape(str(url or "")).replace("\\/", "/").strip()
+    url = url.rstrip(".,);")
+
+    if not url:
+        return
+
+    # SVT Ditto wrapper: unwrap manifestUrl.
+    if "api.svt.se/ditto/api/v3/manifest" in url.lower():
+        try:
+            qs = parse_qs(urlparse(url).query)
+            for wrapped in qs.get("manifestUrl", []):
+                if wrapped:
+                    _lb_svt_push_candidate(out, unquote(wrapped))
+            return
+        except Exception:
+            pass
+
+    # Prefer HLS sibling for SVT switcher DASH URLs when possible.
+    if "switcher.cdn.svt.se/resolve/" in url.lower():
+        hls = (
+            url.replace("/dash-full.mpd", "/hls-cmaf-full.m3u8")
+               .replace("/dash-cmaf.mpd", "/hls-cmaf-avc.m3u8")
+               .replace("/dash.mpd", "/hls-cmaf-full.m3u8")
+        )
+        if hls != url and hls not in out:
+            out.append(hls)
+
+    # Prefer HLS sibling for already-resolved SVT CDN DASH URLs when possible.
+    if re.search(r"https://ed[0-9]+\.cdn\.svt\.se/", url.lower()) or "svt-vod" in url.lower():
+        hls = (
+            url.replace("/dash-full.mpd", "/hls-cmaf-full.m3u8")
+               .replace("/dash-cmaf.mpd", "/hls-cmaf-avc.m3u8")
+               .replace("/dash.mpd", "/hls-cmaf-full.m3u8")
+        )
+        if hls != url and hls not in out:
+            out.append(hls)
+
+    if _lb_svt_looks_like_media_url(url) and url not in out:
+        out.append(url)
+
+
+def _lb_svt_extract_media_candidates_from_blob(blob: str) -> List[str]:
+    s = html_parser.unescape(str(blob or "")).replace("\\/", "/")
+    out: List[str] = []
+
+    # Full URLs.
+    for m in re.finditer(r'https?://[^\s"\'<>]+', s, flags=re.I):
+        _lb_svt_push_candidate(out, m.group(0))
+
+    # Raw manifestUrl=... fragments.
+    for m in re.finditer(r'manifestUrl=([^&"\'<>\s]+)', s, flags=re.I):
+        try:
+            _lb_svt_push_candidate(out, unquote(m.group(1)))
+        except Exception:
+            pass
+
+    # Deduplicate while preserving order.
+    deduped: List[str] = []
+    for item in out:
+        if item and item not in deduped:
+            deduped.append(item)
+
+    return deduped
+
+
+def _lb_svt_extract_match_terms_from_window(html_window: str) -> List[str]:
+    s = html_parser.unescape(str(html_window or ""))
+    terms: List[str] = []
+
+    # Exact aria labels near the selected inlägg are best.
+    for m in re.finditer(r'aria-label=["\']([^"\']*Spela[^"\']+)["\']', s, flags=re.I):
+        label = _lb_svt_norm_text(m.group(1))
+        if label and label not in terms:
+            terms.append(label)
+
+        # Also add title part after dash.
+        parts = re.split(r"\s+[—-]\s+", label, maxsplit=1)
+        if len(parts) == 2:
+            title_part = re.sub(r",\s*[0-9]+\s*(sek|min).*$", "", parts[1], flags=re.I).strip()
+            if title_part and title_part not in terms:
+                terms.append(title_part)
+
+    # Heading text near the selected inlägg.
+    for m in re.finditer(r'<h[1-6][^>]*>(.*?)</h[1-6]>', s, flags=re.I | re.S):
+        heading = _lb_svt_norm_text(m.group(1))
+        if heading and heading not in terms:
+            terms.append(heading)
+
+    # SVT often wraps post heading in span.
+    for m in re.finditer(r'<span[^>]*>([^<]{8,160})</span>', s, flags=re.I | re.S):
+        span_text = _lb_svt_norm_text(m.group(1))
+        if span_text and any(word in span_text.lower() for word in ["trump", "intervju", "rapport", "rasar"]):
+            if span_text not in terms:
+                terms.append(span_text)
+
+    return terms[:8]
+
+
+def _resolve_svt_livepost_via_aria_sniper_1813(job_id: str, article_url: str, inlagg_id: str) -> List[str]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT aria-sniper: playwright import fail: {e}")
+        return []
+
+    media_urls: List[str] = []
+    clicked_media_urls: List[str] = []
+    state = {"after_click": False}
+
+    def _capture_url(url: str, source: str) -> None:
+        if not state.get("after_click"):
+            return
+        if not _lb_svt_looks_like_media_url(url):
+            return
+        if url not in clicked_media_urls:
+            clicked_media_urls.append(url)
+            logger.info(f"[{job_id}] SVT aria-sniper: fångade media efter klick ({source}): {url}")
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--autoplay-policy=no-user-gesture-required",
+                ],
+            )
+
+            context = browser.new_context(
+                viewport={"width": 1365, "height": 2200},
+                user_agent=_AB_UA,
+                locale="sv-SE",
+            )
+
+            page = context.new_page()
+
+            page.on("request", lambda req: _capture_url(req.url, "request"))
+            page.on("response", lambda resp: _capture_url(resp.url, "response"))
+
+            logger.info(f"[{job_id}] SVT aria-sniper: öppnar livepost-sida")
+            page.goto(article_url, wait_until="domcontentloaded", timeout=30000)
+
+            # Give React/Firestore time to populate.
+            try:
+                page.wait_for_timeout(7000)
+            except Exception:
+                pass
+
+            html = page.content()
+            idx = html.find(inlagg_id)
+
+            if idx < 0:
+                logger.info(f"[{job_id}] SVT aria-sniper: inläggs-id finns inte i page.content")
+                context.close()
+                browser.close()
+                return []
+
+            start = max(0, idx - 5000)
+            end = min(len(html), idx + 25000)
+            html_window = html[start:end]
+
+            logger.info(
+                f"[{job_id}] SVT aria-sniper: html-window runt inlägg id hittad "
+                f"(start={start}, end={end}, bytes={len(html_window)})"
+            )
+
+            # First: direct media URL inside the inlägg window. This is the cleanest path.
+            scoped_candidates = _lb_svt_extract_media_candidates_from_blob(html_window)
+            scoped_candidates = [u for u in scoped_candidates if _lb_svt_looks_like_media_url(u)]
+
+            if scoped_candidates:
+                logger.info(
+                    f"[{job_id}] SVT aria-sniper: hittade scoped media direkt i HTML-window: "
+                    f"{scoped_candidates[0]}"
+                )
+                context.close()
+                browser.close()
+                return scoped_candidates
+
+            # Second: extract heading/aria text from the inlägg window and click matching visible play button.
+            match_terms = _lb_svt_extract_match_terms_from_window(html_window)
+            logger.info(f"[{job_id}] SVT aria-sniper: match-termer={match_terms}")
+
+            if not match_terms:
+                logger.info(f"[{job_id}] SVT aria-sniper: inga match-termer hittades i HTML-window")
+                context.close()
+                browser.close()
+                return []
+
+            clicked_label = page.evaluate(
+                """(terms) => {
+                    const norm = (s) => String(s || '')
+                        .replace(/\\s+/g, ' ')
+                        .replace(/[“”]/g, '"')
+                        .trim()
+                        .toLowerCase();
+
+                    const buttons = Array.from(document.querySelectorAll('button[aria-label], button[data-testid="play-pause-button"]'));
+
+                    for (const rawNeedle of terms) {
+                        const needle = norm(rawNeedle);
+                        if (!needle) continue;
+
+                        for (const btn of buttons) {
+                            const label = btn.getAttribute('aria-label') || btn.innerText || '';
+                            const hay = norm(label);
+
+                            if (!hay) continue;
+
+                            if (hay.includes(needle) || needle.includes(hay)) {
+                                btn.scrollIntoView({block: 'center', inline: 'center'});
+                                btn.click();
+                                return label;
+                            }
+                        }
+                    }
+
+                    return '';
+                }""",
+                match_terms,
+            )
+
+            if not clicked_label:
+                logger.info(f"[{job_id}] SVT aria-sniper: hittade ingen synlig knapp som matchade HTML-window")
+                context.close()
+                browser.close()
+                return []
+
+            logger.info(f"[{job_id}] SVT aria-sniper: klickade matchad play-knapp: {clicked_label}")
+
+            state["after_click"] = True
+
+            # Wait for video player to request manifest/media after click.
+            for _ in range(24):
+                try:
+                    page.wait_for_timeout(500)
+                except Exception:
+                    break
+
+            # Also inspect current video[src] after click.
+            try:
+                video_srcs = page.evaluate(
+                    """() => Array.from(document.querySelectorAll('video[src]')).map(v => v.getAttribute('src')).filter(Boolean)"""
+                )
+                for src in video_srcs or []:
+                    _lb_svt_push_candidate(clicked_media_urls, src)
+            except Exception as e:
+                logger.info(f"[{job_id}] SVT aria-sniper: kunde inte läsa video[src] efter klick: {e}")
+
+            context.close()
+            browser.close()
+
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT aria-sniper: misslyckades: {e}")
+        return []
+
+    for item in clicked_media_urls:
+        _lb_svt_push_candidate(media_urls, item)
+
+    media_urls = [u for u in media_urls if _lb_svt_looks_like_media_url(u)]
+
+    if media_urls:
+        logger.info(f"[{job_id}] SVT aria-sniper: slutkandidat={media_urls[0]} totalt={len(media_urls)}")
+    else:
+        logger.info(f"[{job_id}] SVT aria-sniper: ingen media fångad efter klick")
+
+    return media_urls
+
+
+def _resolve_manifests_via_playwright(job_id: str, article_url: str) -> List[str]:
+    parsed_article = urlparse(article_url)
+    query = parse_qs(parsed_article.query)
+    inlagg_id = query.get("inlagg", [None])[0]
+    is_svt_livepost = bool(inlagg_id) and "svt.se" in (article_url or "").lower()
+
+    if is_svt_livepost:
+        logger.info(f"[{job_id}] SVT aria-sniper: använder scoped livepost-väg för inlägg {inlagg_id}")
+        urls = _resolve_svt_livepost_via_aria_sniper_1813(job_id, article_url, inlagg_id)
+        if urls:
+            return urls
+
+        logger.info(
+            f"[{job_id}] SVT aria-sniper: ingen video kunde kopplas till exakt inlägg. "
+            "Avbryter utan global fallback för att undvika fel video."
+        )
+        return []
+
+    return _resolve_manifests_via_playwright_legacy_1812(job_id, article_url)
+
+
+def _resolve_svt_switcher_if_needed(job_id: str, media_url: str) -> str:
+    """Resolverar SVT switcher.cdn.svt.se/resolve-URL:er innan yt-dlp.
+
+    SVT kan ge en URL som slutar på .m3u8 men ändå svarar med application/json.
+    Då måste vi läsa JSON-svaret och skicka den riktiga svt-vod-*.m3u8 vidare till yt-dlp.
+    """
+    url = str(media_url or "").strip()
+    lower = url.lower()
+
+    if "switcher.cdn.svt.se/resolve/" not in lower:
+        return url
+
+    try:
+        logger.info(f"[{job_id}] SVT Switcher: resolverar JSON-wrapper: {url}")
+
+        try:
+            from curl_cffi import requests
+            resp = requests.get(
+                url,
+                impersonate="chrome",
+                headers={
+                    "Accept": "*/*",
+                    "Origin": "https://www.svt.se",
+                    "Referer": "https://www.svt.se/",
+                    "User-Agent": _AB_UA,
+                },
+                timeout=10,
+            )
+            status = getattr(resp, "status_code", 0)
+            ctype = resp.headers.get("content-type", "") if hasattr(resp, "headers") else ""
+            body = resp.text or ""
+        except Exception:
+            req = urllib.request.Request(url, headers={
+                "Accept": "*/*",
+                "Origin": "https://www.svt.se",
+                "Referer": "https://www.svt.se/",
+                "User-Agent": _AB_UA,
+            })
+            with urllib.request.urlopen(req, timeout=10) as r:
+                status = getattr(r, "status", 0)
+                ctype = r.headers.get("content-type", "")
+                body = r.read(2_000_000).decode("utf-8", errors="ignore")
+
+        logger.info(f"[{job_id}] SVT Switcher: status={status} content-type={ctype} bytes={len(body)}")
+
+        candidates: List[str] = []
+
+        def push(candidate: str) -> None:
+            candidate = html_parser.unescape(str(candidate or "")).replace("\\/", "/").strip()
+            if not candidate or candidate.startswith("blob:"):
+                return
+
+            if "api.svt.se/ditto/api/v3/manifest" in candidate:
+                try:
+                    qs = parse_qs(urlparse(candidate).query)
+                    for real_u in qs.get("manifestUrl", []):
+                        push(unquote(real_u))
+                except Exception:
+                    pass
+                return
+
+            if any(x in candidate.lower() for x in [".m3u8", ".mpd", ".mp4", ".m4a", ".mp3"]):
+                if candidate not in candidates:
+                    candidates.append(candidate)
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                for value in obj.values():
+                    walk(value)
+            elif isinstance(obj, list):
+                for value in obj:
+                    walk(value)
+            elif isinstance(obj, str):
+                push(obj)
+
+        try:
+            parsed = json.loads(body)
+            walk(parsed)
+        except Exception:
+            pass
+
+        clean_body = html_parser.unescape(body).replace("\\/", "/")
+
+        for raw in re.findall(r'https%3A%2F%2F[^"\'<>\s]+', clean_body, flags=re.I):
+            push(unquote(raw))
+
+        for pat in [
+            r'https?://svt-vod-[^"\'<>\s]+',
+            r'https?://[^"\'<>\s]+\.m3u8[^"\'<>\s]*',
+            r'https?://[^"\'<>\s]+\.mpd[^"\'<>\s]*',
+            r'https?://[^"\'<>\s]+\.mp4[^"\'<>\s]*',
+        ]:
+            for raw in re.findall(pat, clean_body, flags=re.I):
+                push(raw)
+
+        picked = _pick_best_media_url(candidates)
+        if picked and picked != url:
+            logger.info(f"[{job_id}] SVT Switcher: resolved -> {picked}")
+            return picked
+
+        logger.info(f"[{job_id}] SVT Switcher: hittade ingen underliggande media-URL, behåller original.")
+        return url
+
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT Switcher: resolver misslyckades: {e}")
+        return url
 
 def _yt_dlp_headers_for(url: str) -> List[str]:
     ul = (url or "").lower()
@@ -1400,6 +2050,7 @@ def process_download(job_id: str, url: str, mode: str, actual_format: str, sourc
             logger.info(f"[{job_id}] API/Sniper hittade direktlänk -> {current_url}")
 
         def run_ytdlp_attempt(target_url: str, use_slug_filename: bool):
+            target_url = _resolve_svt_switcher_if_needed(job_id, target_url)
             is_svt = "svt.se" in (url or "").lower()
             SVT_SAFE_VIDEO = "bv*[vcodec^=avc1][ext=mp4]+ba/b[ext=mp4]/b"
 
@@ -1502,6 +2153,13 @@ def process_download(job_id: str, url: str, mode: str, actual_format: str, sourc
                     return
             else:
                 logger.info(f"[{job_id}] Fiskenätet drogs upp tomt.")
+                if current_url.startswith("https://127.0.0.1/force_fail_to_trigger_playwright"):
+                    _update_history_status(job_id, url, "error")
+                    _set_job(job_id, {
+                        "status": "error",
+                        "message": "Ingen video kunde kopplas till exakt SVT-inlägg. Avbröt för att inte hämta fel video."
+                    })
+                    return
 
         if result is None or result.returncode != 0:
             stderr = "" if result is None else (result.stderr or "")
@@ -1652,3 +2310,1537 @@ async def debug_resolve(url: str):
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def _lb1815_clear_svt_consent_overlay(page, job_id: str) -> None:
+    """Remove/accept SVT consent overlay that can intercept Playwright clicks."""
+    try:
+        clicked = False
+
+        candidates = [
+            'button:has-text("Godkänn")',
+            'button:has-text("Acceptera")',
+            'button:has-text("Acceptera alla")',
+            'button:has-text("Tillåt alla")',
+            'button:has-text("OK")',
+            'button:has-text("Stäng")',
+            '[role="dialog"] button',
+            '[class*="ConsentDialog"] button',
+        ]
+
+        for sel in candidates:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    loc.first.click(timeout=1200, force=True)
+                    logger.info(f"[{job_id}] SVT consent-clickfix: klickade/kvitterade overlay via {sel}")
+                    clicked = True
+                    page.wait_for_timeout(400)
+                    break
+            except Exception:
+                pass
+
+        removed = page.evaluate("""() => {
+            let count = 0;
+            const selectors = [
+                '[class*="ConsentDialog"]',
+                '[class*="Cookie"]',
+                '[class*="cookie"]',
+                '[data-testid*="cookie"]',
+                '[data-testid*="consent"]',
+                '[role="dialog"]'
+            ];
+
+            for (const el of Array.from(document.querySelectorAll(selectors.join(',')))) {
+                const txt = (el.innerText || el.textContent || '').toLowerCase();
+                const cls = String(el.className || '').toLowerCase();
+                const looksLikeConsent =
+                    cls.includes('consent') ||
+                    cls.includes('cookie') ||
+                    txt.includes('cookie') ||
+                    txt.includes('kakor') ||
+                    txt.includes('samtycke') ||
+                    txt.includes('personuppgifter') ||
+                    txt.includes('integritet');
+
+                if (looksLikeConsent) {
+                    el.remove();
+                    count++;
+                }
+            }
+
+            document.documentElement.style.overflow = 'auto';
+            document.body.style.overflow = 'auto';
+            return count;
+        }""")
+
+        if removed:
+            logger.info(f"[{job_id}] SVT consent-clickfix: tog bort overlay-element={removed}")
+        elif not clicked:
+            logger.info(f"[{job_id}] SVT consent-clickfix: ingen tydlig overlay hittad")
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT consent-clickfix: overlay cleanup misslyckades: {e}")
+
+
+def _lb1815_click_play_button_safely(page, locator, job_id: str, label: str) -> None:
+    """Click ranked SVT play button even when overlays/actionability block normal click."""
+    _lb1815_clear_svt_consent_overlay(page, job_id)
+
+    try:
+        locator.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+
+    try:
+        locator.click(timeout=5000)
+        logger.info(f"[{job_id}] SVT consent-clickfix: normal klick OK: {label}")
+        return
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT consent-clickfix: normal klick blockerades: {e}")
+
+    _lb1815_clear_svt_consent_overlay(page, job_id)
+
+    try:
+        locator.click(timeout=3000, force=True)
+        logger.info(f"[{job_id}] SVT consent-clickfix: force-klick OK: {label}")
+        return
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT consent-clickfix: force-klick blockerades: {e}")
+
+    try:
+        handle = locator.element_handle(timeout=3000)
+        if not handle:
+            raise RuntimeError("no element_handle for ranked play button")
+        page.evaluate("(el) => el.click()", handle)
+        logger.info(f"[{job_id}] SVT consent-clickfix: JS-click OK: {label}")
+        page.wait_for_timeout(500)
+        return
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT consent-clickfix: JS-click misslyckades: {e}")
+        raise
+
+# === LjudBuster 1.8.14-dev: SVT ranked aria sniper override ===
+
+def _lb1814_norm_text(value: str) -> str:
+    value = html_parser.unescape(str(value or ""))
+    value = value.replace("\\/", "/").replace("\xa0", " ")
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _lb1814_tokens(value: str) -> set:
+    value = _lb1814_norm_text(value).lower()
+    value = value.replace("—", " ").replace("–", " ").replace("-", " ")
+    words = re.findall(r"[a-zåäö0-9]{3,}", value, flags=re.I)
+    stop = {
+        "spela", "rapport", "video", "sek", "min", "och", "att", "det", "som",
+        "för", "från", "till", "med", "den", "detta", "där", "här", "har",
+        "hur", "vad", "när", "senaste", "nytt", "usa", "politik"
+    }
+    return {w for w in words if w not in stop}
+
+
+def _lb1814_is_media_url(url: str) -> bool:
+    lower = str(url or "").lower()
+
+    if not lower.startswith("http"):
+        return False
+
+    reject = [
+        "__manifest",
+        "/assets/manifest-",
+        "news-render/assets",
+        "firestore.googleapis.com",
+        "google.firestore",
+        ".js",
+        ".css",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".svg",
+        ".woff",
+        ".woff2",
+    ]
+    if any(x in lower for x in reject):
+        return False
+
+    accept = [
+        ".m3u8",
+        ".mpd",
+        "switcher.cdn.svt.se/resolve/",
+        "api.svt.se/ditto/api/v3/manifest",
+        "svt-vod",
+        "cdn.svt.se/d0/",
+        "akamaized.net/",
+    ]
+    return any(x in lower for x in accept)
+
+
+def _lb1814_unwrap_media_urls(blob: str) -> list:
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    raw = html_parser.unescape(str(blob or "")).replace("\\/", "/")
+    out = []
+
+    def push(u: str) -> None:
+        u = html_parser.unescape(str(u or "")).replace("\\/", "/").strip()
+        u = u.rstrip(".,;)'\"<>]")
+        if not u:
+            return
+
+        try:
+            parsed = urlparse(u)
+            qs = parse_qs(parsed.query)
+            for key in ("manifestUrl", "manifesturl", "url"):
+                for nested in qs.get(key, []):
+                    nested = unquote(nested)
+                    if _lb1814_is_media_url(nested):
+                        out.append(nested)
+        except Exception:
+            pass
+
+        if _lb1814_is_media_url(u):
+            out.append(u)
+
+        # Chromium/SVT ger ofta DASH via switcher. Lägg HLS-syskon som förstaval också.
+        if "switcher.cdn.svt.se/resolve/" in u and u.endswith("/dash-full.mpd"):
+            out.append(u.replace("/dash-full.mpd", "/hls-cmaf-full.m3u8"))
+            out.append(u.replace("/dash-full.mpd", "/hls-cmaf-avc.m3u8"))
+
+        if "/dash-full.mpd" in u:
+            out.append(u.replace("/dash-full.mpd", "/hls-cmaf-full.m3u8"))
+            out.append(u.replace("/dash-full.mpd", "/hls-cmaf-avc.m3u8"))
+
+    for m in re.finditer(r"https?://[^\s\"'<>\\)]+", raw):
+        push(m.group(0))
+
+    for m in re.finditer(r"manifestUrl=([^&\"'<>\\)]+)", raw, flags=re.I):
+        push(unquote(m.group(1)))
+
+    seen = set()
+    clean = []
+    for u in out:
+        if not u or u in seen:
+            continue
+        if not _lb1814_is_media_url(u):
+            continue
+        seen.add(u)
+        clean.append(u)
+
+    return clean
+
+
+def _lb1814_extract_strict_post_block(html: str, inlagg_id: str) -> str:
+    """Returnerar bara block om vi hittar riktig id-attribut-träff, inte bara id i manifest/query."""
+    if not html or not inlagg_id:
+        return ""
+
+    patterns = [
+        f'id="{inlagg_id}"',
+        f"id='{inlagg_id}'",
+        f'id=&quot;{inlagg_id}&quot;',
+    ]
+
+    pos = -1
+    for pat in patterns:
+        pos = html.find(pat)
+        if pos >= 0:
+            break
+
+    if pos < 0:
+        return ""
+
+    # Backa till närmaste <div före id-attributet.
+    start = html.rfind("<div", 0, pos)
+    if start < 0:
+        start = max(0, pos - 2000)
+
+    # Enkel men robust nog: ta rimlig post-slice fram till några kommande post-root/id.
+    end = len(html)
+    next_markers = [
+        html.find('class="_Post__root', pos + len(inlagg_id)),
+        html.find('data-created-at=', pos + len(inlagg_id)),
+        html.find('<div id="', pos + len(inlagg_id)),
+        html.find("<div id='", pos + len(inlagg_id)),
+    ]
+    next_markers = [x for x in next_markers if x > pos]
+    if next_markers:
+        end = min(next_markers)
+
+    # Säkerhetscap så vi inte råkar mata in halva sidan.
+    end = min(end, start + 45000)
+    return html[start:end]
+
+
+def _lb1814_extract_match_terms(scope_html: str) -> list:
+    terms = []
+
+    raw = html_parser.unescape(str(scope_html or "")).replace("\\/", "/")
+
+    # Aria labels är bäst eftersom de ofta exakt speglar play-knappen.
+    for m in re.finditer(r'aria-label=["\']([^"\']{8,180})["\']', raw, flags=re.I):
+        terms.append(_lb1814_norm_text(m.group(1)))
+
+    # Rubriker / text i postblock.
+    for tag in ("h1", "h2", "h3", "h4", "span", "p"):
+        for m in re.finditer(rf"<{tag}[^>]*>(.*?)</{tag}>", raw, flags=re.I | re.S):
+            val = _lb1814_norm_text(m.group(1))
+            if 10 <= len(val) <= 160:
+                terms.append(val)
+
+    bad_exact = {"video", "senaste nytt", "visa inlägg"}
+    cleaned = []
+    seen = set()
+
+    for t in terms:
+        t = _lb1814_norm_text(t)
+        low = t.lower()
+
+        if len(t) < 10:
+            continue
+        if low in bad_exact:
+            continue
+        if low.startswith("senaste nytt om ") and len(t) < 45:
+            continue
+        if t in seen:
+            continue
+
+        seen.add(t)
+        cleaned.append(t)
+
+    # Längre / mer specifika termer först.
+    cleaned.sort(key=lambda x: (len(_lb1814_tokens(x)), len(x)), reverse=True)
+    return cleaned[:20]
+
+
+def _lb1814_score_button(label: str, terms: list) -> int:
+    label_n = _lb1814_norm_text(label).lower()
+    label_tokens = _lb1814_tokens(label)
+    score = 0
+
+    if not label_tokens:
+        return 0
+
+    for term in terms:
+        term_n = _lb1814_norm_text(term).lower()
+        term_tokens = _lb1814_tokens(term)
+
+        if not term_tokens:
+            continue
+
+        if term_n and term_n in label_n:
+            score += 1000 + (len(term_tokens) * 80) + len(term_n)
+
+        overlap = label_tokens & term_tokens
+        if overlap:
+            score += len(overlap) * 120
+            if len(overlap) >= 3:
+                score += len(overlap) * 160
+
+        # Extra bonus när en kort rubrik och aria-label säger samma sak men inte exakt.
+        if len(overlap) >= max(2, min(4, len(term_tokens))):
+            score += 300
+
+    return score
+
+
+def _lb1814_resolve_svt_livepost_ranked(job_id: str, article_url: str, inlagg_id: str) -> list:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT ranked-sniper: playwright import fail: {e}")
+        return []
+
+    media_after_click = []
+    media_all = []
+    clicked = {"active": False}
+
+    def remember(url: str, source: str) -> None:
+        for candidate in _lb1814_unwrap_media_urls(url):
+            if candidate not in media_all:
+                media_all.append(candidate)
+
+            if clicked["active"] and candidate not in media_after_click:
+                media_after_click.append(candidate)
+                logger.info(f"[{job_id}] SVT ranked-sniper: fångade media efter klick ({source}): {candidate}")
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--autoplay-policy=no-user-gesture-required",
+            ],
+        )
+
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 9000},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/142.0.0.0 Safari/537.36"
+            ),
+            locale="sv-SE",
+        )
+
+        page = context.new_page()
+
+        page.on("request", lambda req: remember(req.url, "request"))
+
+        def on_response(resp):
+            try:
+                remember(resp.url, "response-url")
+                ctype = (resp.headers or {}).get("content-type", "")
+                if any(x in ctype.lower() for x in ("json", "text", "mpegurl", "dash", "xml")):
+                    try:
+                        body = resp.text()
+                        for candidate in _lb1814_unwrap_media_urls(body):
+                            remember(candidate, "response-body")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+        try:
+            logger.info(f"[{job_id}] SVT ranked-sniper: öppnar livepost-sida")
+            page.goto(article_url, wait_until="domcontentloaded", timeout=35000)
+            page.wait_for_timeout(7000)
+
+            html = page.content()
+            strict_block = _lb1814_extract_strict_post_block(html, inlagg_id)
+
+            if strict_block:
+                logger.info(f"[{job_id}] SVT ranked-sniper: hittade strikt postblock för id={inlagg_id} bytes={len(strict_block)}")
+                terms = _lb1814_extract_match_terms(strict_block)
+
+                direct = _lb1814_unwrap_media_urls(strict_block)
+                if direct:
+                    logger.info(f"[{job_id}] SVT ranked-sniper: hittade media direkt i strikt postblock: {direct[0]}")
+                    return direct
+            else:
+                logger.info(
+                    f"[{job_id}] SVT ranked-sniper: inget strikt postblock för id={inlagg_id}. "
+                    "Använder rankad aria-fallback utan global mediafallback."
+                )
+
+                # Fallback: använd liten, försiktig window runt id-förekomst ENDAST för texttermer,
+                # aldrig för direkt media, eftersom id kan ligga i __manifest-brus.
+                pos = html.find(inlagg_id)
+                if pos >= 0:
+                    loose = html[max(0, pos - 6000):min(len(html), pos + 30000)]
+                    terms = _lb1814_extract_match_terms(loose)
+                else:
+                    terms = []
+
+            logger.info(f"[{job_id}] SVT ranked-sniper: match-termer={terms}")
+
+            if not terms:
+                logger.info(f"[{job_id}] SVT ranked-sniper: inga match-termer, avbryter livepost för att undvika fel video.")
+                return []
+
+            buttons = page.locator('button[data-testid="play-pause-button"], button[data-rt="video-player-splash-play"], button[aria-label*="Spela"]')
+            count = buttons.count()
+
+            ranked = []
+            for i in range(count):
+                btn = buttons.nth(i)
+                try:
+                    if not btn.is_visible(timeout=800):
+                        continue
+
+                    label = btn.get_attribute("aria-label") or btn.inner_text(timeout=800) or ""
+                    label = _lb1814_norm_text(label)
+                    box = btn.bounding_box() or {}
+                    score = _lb1814_score_button(label, terms)
+
+                    ranked.append({
+                        "index": i,
+                        "score": score,
+                        "label": label,
+                        "y": box.get("y", 999999),
+                    })
+                except Exception:
+                    continue
+
+            ranked.sort(key=lambda x: (x["score"], -int(x["y"])), reverse=True)
+
+            logger.info(f"[{job_id}] SVT ranked-sniper: knapp-ranking topp={ranked[:5]}")
+
+            if not ranked or ranked[0]["score"] <= 0:
+                logger.info(f"[{job_id}] SVT ranked-sniper: ingen knapp fick positiv score.")
+                return []
+
+            chosen = ranked[0]
+            btn = buttons.nth(chosen["index"])
+            btn.scroll_into_view_if_needed(timeout=3000)
+
+            clicked["active"] = True
+            _lb1815_click_play_button_safely(page, btn, job_id, best.get("label", "") if isinstance(best, dict) else "")
+            logger.info(
+                f"[{job_id}] SVT ranked-sniper: klickade rankad play-knapp "
+                f"score={chosen['score']} label={chosen['label']}"
+            )
+
+            page.wait_for_timeout(12000)
+
+            # Läs video[src] efter klick som sista scoped källa.
+            try:
+                video_srcs = page.evaluate("""
+                    () => Array.from(document.querySelectorAll('video'))
+                        .map(v => v.currentSrc || v.src || '')
+                        .filter(Boolean)
+                """)
+                for src in video_srcs or []:
+                    remember(src, "video-src-after-click")
+            except Exception as e:
+                logger.info(f"[{job_id}] SVT ranked-sniper: kunde inte läsa video[src] efter klick: {e}")
+
+        except Exception as e:
+            logger.info(f"[{job_id}] SVT ranked-sniper: misslyckades: {e}")
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    # Bara efter-klick-kandidater får användas för livepost.
+    out = []
+    seen = set()
+    for u in media_after_click:
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+
+    if out:
+        logger.info(f"[{job_id}] SVT ranked-sniper: slutkandidat={out[0]} totalt={len(out)}")
+    else:
+        logger.info(f"[{job_id}] SVT ranked-sniper: ingen media fångad efter rankad klick.")
+
+    return out
+
+
+def _resolve_manifests_via_playwright(job_id: str, article_url: str) -> List[str]:
+    """1.8.14 override.
+
+    SVT ?inlagg= kör strikt/rankad livepost-sniper.
+    Övriga sidor går till legacy-resolvern.
+    """
+    try:
+        parsed = urlparse(article_url)
+        query = parse_qs(parsed.query)
+        inlagg_id = query.get("inlagg", [None])[0]
+        is_svt = "svt.se" in (article_url or "").lower() or "svtplay.se" in (article_url or "").lower()
+
+        if is_svt and inlagg_id:
+            logger.info(f"[{job_id}] SVT ranked-sniper: använder 1.8.14 livepost-väg för inlägg {inlagg_id}")
+            urls = _lb1814_resolve_svt_livepost_ranked(job_id, article_url, inlagg_id)
+            if urls:
+                return urls
+
+            logger.info(
+                f"[{job_id}] SVT ranked-sniper: ingen video kunde kopplas till exakt inlägg. "
+                "Avbryter utan global fallback."
+            )
+            return []
+
+        if "_resolve_manifests_via_playwright_legacy_1812" in globals():
+            return _resolve_manifests_via_playwright_legacy_1812(job_id, article_url)
+
+        return []
+
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT ranked-sniper: wrapper misslyckades: {e}")
+        return []
+
+# === End LjudBuster 1.8.14-dev override ===
+
+
+# === LjudBuster 1.8.16-dev: final SVT Playwright override ===
+
+def _lb1816_norm(value):
+    value = html_parser.unescape(str(value or ""))
+    value = value.replace("\\/", "/").replace("\xa0", " ")
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _lb1816_tokens(value):
+    value = _lb1816_norm(value).lower()
+    value = value.replace("—", " ").replace("–", " ").replace("-", " ")
+    words = re.findall(r"[a-zåäö0-9]{3,}", value, flags=re.I)
+    stop = {
+        "spela", "rapport", "video", "sek", "min", "och", "att", "det", "som",
+        "för", "från", "till", "med", "den", "detta", "där", "här", "har",
+        "hur", "vad", "när", "senaste", "nytt", "usa", "politik", "visa",
+        "inlägg", "inlagg", "öppna", "meny", "fler", "händelser"
+    }
+    return {w for w in words if w not in stop}
+
+
+def _lb1816_unwrap_media_urls(blob):
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    raw = html_parser.unescape(str(blob or "")).replace("\\/", "/")
+    out = []
+
+    def push(url):
+        url = html_parser.unescape(str(url or "")).replace("\\/", "/").strip()
+        url = url.strip('\'"<>),;')
+        if not url.startswith("http"):
+            return
+
+        lower = url.lower()
+
+        if "__manifest" in lower:
+            return
+        if "/assets/manifest-" in lower:
+            return
+        if "firestore.googleapis.com" in lower:
+            return
+        if "sentry" in lower:
+            return
+
+        if "api.svt.se/ditto/api" in lower and "manifesturl=" in lower:
+            try:
+                qs = parse_qs(urlparse(url).query)
+                nested = qs.get("manifestUrl") or qs.get("manifesturl")
+                if nested:
+                    push(unquote(nested[0]))
+                    return
+            except Exception:
+                pass
+
+        if (
+            ".m3u8" in lower
+            or ".mpd" in lower
+            or "switcher.cdn.svt.se/resolve/" in lower
+            or "svt-vod" in lower
+            or "cdn.svt.se" in lower
+            or "akamaized.net" in lower
+        ):
+            out.append(url)
+
+    for m in re.finditer(r'manifestUrl=([^&"\'<> ]+)', raw, flags=re.I):
+        push(unquote(m.group(1)))
+
+    for m in re.finditer(r'https?://[^"\'<>\s]+', raw):
+        push(m.group(0))
+
+    seen = set()
+    clean = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            clean.append(u)
+    return clean
+
+
+def _lb1816_resolve_final_media(job_id, url):
+    url = str(url or "").strip()
+    if not url:
+        return ""
+
+    if "api.svt.se/ditto/api" in url.lower() and "manifesturl=" in url.lower():
+        nested = _lb1816_unwrap_media_urls(url)
+        if nested:
+            url = nested[0]
+
+    if "switcher.cdn.svt.se/resolve/" in url.lower():
+        try:
+            return _resolve_svt_switcher_if_needed(job_id, url)
+        except Exception as e:
+            logger.info(f"[{job_id}] SVT 1.8.16: switcher resolve misslyckades: {e}")
+            return url
+
+    return url
+
+
+def _lb1816_clear_consent(page, job_id):
+    try:
+        clicked = False
+        selectors = [
+            'button:has-text("Godkänn")',
+            'button:has-text("Acceptera")',
+            'button:has-text("Acceptera alla")',
+            'button:has-text("Tillåt alla")',
+            'button:has-text("OK")',
+            '[class*="ConsentDialog"] button',
+            '[role="dialog"] button',
+        ]
+
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    loc.first.click(timeout=800, force=True)
+                    logger.info(f"[{job_id}] SVT 1.8.16: consent-overlay kvitterad via {sel}")
+                    page.wait_for_timeout(300)
+                    clicked = True
+                    break
+            except Exception:
+                pass
+
+        removed = page.evaluate("""() => {
+            let count = 0;
+            const selectors = [
+                '[class*="ConsentDialog"]',
+                '[class*="Cookie"]',
+                '[class*="cookie"]',
+                '[data-testid*="cookie"]',
+                '[data-testid*="consent"]',
+                '[role="dialog"]'
+            ];
+            for (const el of Array.from(document.querySelectorAll(selectors.join(',')))) {
+                const txt = (el.innerText || el.textContent || '').toLowerCase();
+                const cls = String(el.className || '').toLowerCase();
+                const hit =
+                    cls.includes('consent') ||
+                    cls.includes('cookie') ||
+                    txt.includes('cookie') ||
+                    txt.includes('kakor') ||
+                    txt.includes('samtycke') ||
+                    txt.includes('personuppgifter') ||
+                    txt.includes('integritet');
+
+                if (hit) {
+                    el.remove();
+                    count++;
+                }
+            }
+            document.documentElement.style.overflow = 'auto';
+            document.body.style.overflow = 'auto';
+            return count;
+        }""")
+
+        if removed:
+            logger.info(f"[{job_id}] SVT 1.8.16: consent-overlay borttagen element={removed}")
+        elif not clicked:
+            logger.info(f"[{job_id}] SVT 1.8.16: ingen consent-overlay hittad")
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT 1.8.16: consent-cleanup fel: {e}")
+
+
+def _lb1816_button_scoped_video_src(button):
+    try:
+        return button.evaluate("""(btn) => {
+            function clean(v) {
+                if (!v) return "";
+                return String(v).replaceAll("&amp;", "&");
+            }
+
+            let node = btn;
+            for (let depth = 0; node && depth < 12; depth++, node = node.parentElement) {
+                const video = node.querySelector && node.querySelector('video[src]');
+                if (video && video.src) return clean(video.src);
+
+                const source = node.querySelector && node.querySelector('source[src]');
+                if (source && source.src) return clean(source.src);
+
+                const html = node.innerHTML || "";
+                const m = html.match(/https?:\\/\\/[^"'<>\\s]+(?:m3u8|mpd|manifestUrl=[^"'<>\\s]+)/i);
+                if (m) return clean(m[0]);
+            }
+
+            return "";
+        }""")
+    except Exception:
+        return ""
+
+
+def _lb1816_terms_from_page_content(page, inlagg_id):
+    html = page.content()
+    terms = []
+
+    # Try window around exact id. SVT sometimes has id in rendered payload rather than queryable DOM.
+    idx = html.find(inlagg_id)
+    if idx >= 0:
+        window = html[max(0, idx - 9000): idx + 22000]
+    else:
+        window = html
+
+    # aria-labels from play buttons
+    for m in re.finditer(r'aria-label=["\']([^"\']{8,220})["\']', window, flags=re.I):
+        terms.append(_lb1816_norm(m.group(1)))
+
+    # headings/spans/paragraph-ish text
+    for m in re.finditer(r'<(?:h1|h2|h3|span|p|em)[^>]*>(.*?)</(?:h1|h2|h3|span|p|em)>', window, flags=re.I | re.S):
+        t = _lb1816_norm(m.group(1))
+        if 8 <= len(t) <= 220:
+            terms.append(t)
+
+    # visible button-ish text
+    for m in re.finditer(r'<button[^>]*>(.*?)</button>', window, flags=re.I | re.S):
+        t = _lb1816_norm(m.group(1))
+        if 3 <= len(t) <= 160:
+            terms.append(t)
+
+    seen = set()
+    out = []
+    for t in terms:
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+
+    return out[:40], window
+
+
+def _lb1816_rank_play_buttons(page, terms):
+    term_tokens = set()
+    term_text = " ".join(terms).lower()
+
+    for t in terms:
+        term_tokens |= _lb1816_tokens(t)
+
+    buttons = page.locator('button[data-testid="play-pause-button"], button[data-rt="video-player-splash-play"], button[aria-label*="Spela"]')
+
+    ranked = []
+    count = buttons.count()
+
+    for i in range(count):
+        btn = buttons.nth(i)
+        try:
+            label = btn.get_attribute("aria-label") or ""
+            text = btn.inner_text(timeout=1000) or ""
+            box = btn.bounding_box() or {}
+            y = float(box.get("y") or 0)
+        except Exception:
+            continue
+
+        hay = f"{label} {text}"
+        btoks = _lb1816_tokens(hay)
+
+        score = 0
+        overlap = btoks & term_tokens
+        score += len(overlap) * 1000
+
+        low_label = label.lower()
+
+        # Strong phrase scoring: actual titles from the target post should dominate.
+        for term in terms:
+            tl = term.lower()
+            if len(tl) >= 12 and tl in low_label:
+                score += min(len(tl), 120) * 50
+
+        # De-prioritize generic page/player labels unless they also have strong token overlap.
+        if "spela rapport" in low_label:
+            score += 50
+        if "trump" in low_label and "hemska" in low_label:
+            score += 5000
+        if "bilder från hotellet" in low_label:
+            score -= 1000
+
+        if score > 0:
+            ranked.append({
+                "index": i,
+                "score": score,
+                "label": label,
+                "text": text,
+                "y": y,
+                "overlap": sorted(overlap),
+            })
+
+    ranked.sort(key=lambda x: (-x["score"], x["y"]))
+    return buttons, ranked
+
+
+def _lb1816_resolve_svt_livepost(job_id, article_url, inlagg_id):
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT 1.8.16: playwright import fail: {e}")
+        return []
+
+    captured = []
+    collecting = {"active": False}
+
+    def push_candidate(url, source):
+        for u in _lb1816_unwrap_media_urls(url):
+            final = _lb1816_resolve_final_media(job_id, u)
+            if final and final not in captured:
+                captured.append(final)
+                logger.info(f"[{job_id}] SVT 1.8.16: fångade media ({source}): {final}")
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--autoplay-policy=no-user-gesture-required",
+                ],
+            )
+
+            context = browser.new_context(
+                viewport={"width": 1440, "height": 1200},
+                locale="sv-SE",
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/142.0.0.0 Safari/537.36"
+                ),
+            )
+
+            page = context.new_page()
+
+            def on_request(req):
+                if collecting["active"]:
+                    push_candidate(req.url, "request-after-click")
+
+            def on_response(resp):
+                if collecting["active"]:
+                    push_candidate(resp.url, "response-after-click")
+
+            page.on("request", on_request)
+            page.on("response", on_response)
+
+            logger.info(f"[{job_id}] SVT 1.8.16: öppnar livepost-sida")
+            page.goto(article_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(6500)
+
+            terms, html_window = _lb1816_terms_from_page_content(page, inlagg_id)
+            direct = _lb1816_unwrap_media_urls(html_window)
+
+            if direct:
+                final_direct = [_lb1816_resolve_final_media(job_id, u) for u in direct]
+                final_direct = [u for u in final_direct if u]
+                if final_direct:
+                    logger.info(f"[{job_id}] SVT 1.8.16: hittade media direkt i HTML-window: {final_direct[0]}")
+                    browser.close()
+                    return final_direct[:3]
+
+            logger.info(f"[{job_id}] SVT 1.8.16: match-termer={terms[:20]}")
+
+            if not terms:
+                logger.info(f"[{job_id}] SVT 1.8.16: inga match-termer, avbryter för att undvika fel video")
+                browser.close()
+                return []
+
+            buttons, ranked = _lb1816_rank_play_buttons(page, terms)
+            logger.info(f"[{job_id}] SVT 1.8.16: knapp-ranking topp={ranked[:5]}")
+
+            if not ranked:
+                logger.info(f"[{job_id}] SVT 1.8.16: ingen play-knapp fick positiv score")
+                browser.close()
+                return []
+
+            best = ranked[0]
+            button = buttons.nth(best["index"])
+
+            # First: read the video src from the same player container. This is the least flaky path.
+            pre_src = _lb1816_button_scoped_video_src(button)
+            pre_urls = _lb1816_unwrap_media_urls(pre_src)
+            if pre_urls:
+                final = [_lb1816_resolve_final_media(job_id, u) for u in pre_urls]
+                final = [u for u in final if u]
+                if final:
+                    logger.info(
+                        f"[{job_id}] SVT 1.8.16: hittade scoped video[src] före klick "
+                        f"label={best['label']} url={final[0]}"
+                    )
+                    browser.close()
+                    return final[:3]
+
+            _lb1816_clear_consent(page, job_id)
+
+            try:
+                button.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+
+            collecting["active"] = True
+
+            clicked = False
+            try:
+                button.click(timeout=5000)
+                clicked = True
+                logger.info(f"[{job_id}] SVT 1.8.16: normal klick OK label={best['label']}")
+            except Exception as e:
+                logger.info(f"[{job_id}] SVT 1.8.16: normal klick fail: {e}")
+
+            if not clicked:
+                _lb1816_clear_consent(page, job_id)
+                try:
+                    button.click(timeout=3000, force=True)
+                    clicked = True
+                    logger.info(f"[{job_id}] SVT 1.8.16: force-klick OK label={best['label']}")
+                except Exception as e:
+                    logger.info(f"[{job_id}] SVT 1.8.16: force-klick fail: {e}")
+
+            if not clicked:
+                try:
+                    handle = button.element_handle(timeout=3000)
+                    page.evaluate("(el) => el.click()", handle)
+                    clicked = True
+                    logger.info(f"[{job_id}] SVT 1.8.16: JS-click OK label={best['label']}")
+                except Exception as e:
+                    logger.info(f"[{job_id}] SVT 1.8.16: JS-click fail: {e}")
+
+            page.wait_for_timeout(7000)
+            collecting["active"] = False
+
+            post_src = _lb1816_button_scoped_video_src(button)
+            for u in _lb1816_unwrap_media_urls(post_src):
+                final = _lb1816_resolve_final_media(job_id, u)
+                if final and final not in captured:
+                    captured.append(final)
+                    logger.info(f"[{job_id}] SVT 1.8.16: hittade scoped video[src] efter klick: {final}")
+
+            browser.close()
+
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT 1.8.16: resolver misslyckades: {e}")
+
+    if captured:
+        logger.info(f"[{job_id}] SVT 1.8.16: slutkandidat={captured[0]} totalt={len(captured)}")
+    else:
+        logger.info(f"[{job_id}] SVT 1.8.16: ingen media kunde kopplas till exakt inlägg")
+
+    return captured[:3]
+
+
+def _resolve_manifests_via_playwright(job_id: str, article_url: str):
+    from urllib.parse import parse_qs, urlparse
+
+    try:
+        parsed = urlparse(article_url)
+        inlagg_id = parse_qs(parsed.query).get("inlagg", [None])[0]
+        is_svt = "svt.se" in (article_url or "").lower() or "svtplay.se" in (article_url or "").lower()
+
+        if is_svt and inlagg_id:
+            logger.info(f"[{job_id}] SVT 1.8.16: använder final livepost-resolver för inlägg {inlagg_id}")
+            urls = _lb1816_resolve_svt_livepost(job_id, article_url, inlagg_id)
+
+            if urls:
+                return urls
+
+            logger.info(
+                f"[{job_id}] SVT 1.8.16: ingen video kunde kopplas till exakt inlägg. "
+                "Avbryter utan global fallback."
+            )
+            return []
+
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT 1.8.16: wrapper fel: {e}")
+        return []
+
+    try:
+        return _resolve_manifests_via_playwright_legacy_1812(job_id, article_url)
+    except NameError:
+        logger.info(f"[{job_id}] SVT 1.8.16: legacy resolver saknas")
+        return []
+
+# === End LjudBuster 1.8.16-dev override ===
+
+
+# === LjudBuster 1.8.17-dev: SVT title NEAR resolver override ===
+
+_lb1817_previous_resolve_manifests_via_playwright = _resolve_manifests_via_playwright
+
+
+def _lb1817_norm_text(value: str) -> str:
+    value = html_parser.unescape(str(value or ""))
+    value = value.replace("\\/", "/").replace("\xa0", " ")
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _lb1817_tokens(value: str) -> set:
+    value = _lb1817_norm_text(value).lower()
+    value = value.replace("—", " ").replace("–", " ").replace("-", " ")
+    words = re.findall(r"[a-zåäö0-9]{3,}", value, flags=re.I)
+    stop = {
+        "spela", "rapport", "video", "sek", "min", "och", "att", "det",
+        "som", "för", "från", "till", "med", "den", "detta", "där", "här",
+        "har", "hur", "vad", "när", "senaste", "nytt", "usa", "politik",
+        "visa", "länkar", "under", "meny", "öppna", "huvudmeny", "snabbmeny",
+    }
+    return {w for w in words if w and w not in stop}
+
+
+def _lb1817_looks_like_media_url(url: str) -> bool:
+    lower = str(url or "").lower()
+
+    if not lower.startswith("http"):
+        return False
+
+    bad = [
+        "doubleclick", "freewheel", "videoplaza", "adform", "googlesyndication",
+        "firestore.googleapis.com", "__manifest", "/assets/manifest-",
+        "sentry", "analytics", "privacy-mgmt",
+    ]
+    if any(x in lower for x in bad):
+        return False
+
+    good = [
+        ".m3u8", ".mpd", ".mp4", ".m4a", ".mp3",
+        "api.svt.se/ditto/api/v3/manifest",
+        "switcher.cdn.svt.se/resolve/",
+        "svt-vod", ".cdn.svt.se/d0/",
+        "video.svt.se/video/",
+    ]
+    return any(x in lower for x in good)
+
+
+def _lb1817_unwrap_media_url(job_id: str, url: str) -> list:
+    from urllib.parse import parse_qs, urlparse, unquote
+
+    raw = str(url or "").strip()
+    if not raw:
+        return []
+
+    out = []
+
+    try:
+        parsed = urlparse(raw)
+        qs = parse_qs(parsed.query)
+
+        if "api.svt.se/ditto/api/v3/manifest" in raw and qs.get("manifestUrl"):
+            out.append(unquote(qs["manifestUrl"][0]))
+
+        elif "switcher.cdn.svt.se/resolve/" in raw:
+            try:
+                out.append(_resolve_svt_switcher_if_needed(job_id, raw))
+            except Exception:
+                out.append(raw)
+
+        else:
+            out.append(raw)
+
+    except Exception:
+        out.append(raw)
+
+    clean = []
+    for item in out:
+        item = str(item or "").strip()
+        if item and item not in clean and _lb1817_looks_like_media_url(item):
+            clean.append(item)
+
+    return clean
+
+
+def _lb1817_extract_title_terms_from_html(html: str, inlagg_id: str) -> list:
+    """Tar bara text EFTER exakt inlägg-id.
+
+    Det är kärnfixen jämfört med 1.8.16:
+    tidigare kunde text från föregående post hamna i scoring-fönstret.
+    """
+    if not html or not inlagg_id:
+        return []
+
+    pos = html.find(inlagg_id)
+    if pos < 0:
+        return []
+
+    # Bara framåt från träffen. Inte bakåt till sidtopp/föregående inlägg.
+    window = html[pos:pos + 45000]
+
+    terms = []
+
+    # Starkast: rubriker efter id:t, t.ex. <h3><span>Trump rasar...</span></h3>
+    for m in re.finditer(r"<h[1-4][^>]*>(.*?)</h[1-4]>", window, flags=re.I | re.S):
+        t = _lb1817_norm_text(m.group(1))
+        if 12 <= len(t) <= 180:
+            terms.append(t)
+
+    # Näst starkast: videoknappens aria-label efter id:t.
+    for m in re.finditer(r'aria-label=["\']([^"\']*Spela[^"\']+)["\']', window, flags=re.I | re.S):
+        t = _lb1817_norm_text(m.group(1))
+        if 12 <= len(t) <= 220:
+            terms.append(t)
+
+    # Extra stöd: kortare textfragment i postens brödtext, men bara sådant med vettiga tokens.
+    for m in re.finditer(r"<p[^>]*>(.*?)</p>", window, flags=re.I | re.S):
+        t = _lb1817_norm_text(m.group(1))
+        toks = _lb1817_tokens(t)
+        if 18 <= len(t) <= 220 and len(toks) >= 3:
+            terms.append(t)
+
+    # Rensa generiskt skräp.
+    bad_exact = {
+        "Video", "Fler händelser", "Visa inlägget", "Skriv inlägg",
+        "Öppna meny", "Visa länkar under Nyheter", "Visa länkar under Lokalt",
+        "Visa länkar under Sport",
+    }
+
+    unique = []
+    for term in terms:
+        term = _lb1817_norm_text(term)
+        if not term or term in bad_exact:
+            continue
+        if len(_lb1817_tokens(term)) < 2:
+            continue
+        if term not in unique:
+            unique.append(term)
+
+    return unique[:12]
+
+
+def _lb1817_accept_or_remove_consent(page, job_id: str) -> None:
+    selectors = [
+        'button:has-text("Tillåt alla")',
+        'button:has-text("Godkänn alla cookies")',
+        'button:has-text("Godkänn alla")',
+        'button:has-text("Acceptera")',
+        'button:has-text("Jag godkänner")',
+    ]
+
+    for sel in selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible(timeout=700):
+                btn.click(timeout=1200)
+                logger.info(f"[{job_id}] SVT 1.8.17: consent kvitterad via {sel}")
+                page.wait_for_timeout(300)
+                break
+        except Exception:
+            pass
+
+    # Fallback: om SVT-overlay fortfarande fångar klick, ta bort den lokalt i headless-DOM.
+    try:
+        removed = page.evaluate("""() => {
+            const nodes = Array.from(document.querySelectorAll(
+                '[class*="ConsentDialog"], [data-testid*="consent"], div[role="main"]'
+            ));
+            let n = 0;
+            for (const el of nodes) {
+                const txt = (el.innerText || '').toLowerCase();
+                const cls = (el.className || '').toString().toLowerCase();
+                if (txt.includes('cookies') || txt.includes('samtycke') || cls.includes('consentdialog')) {
+                    el.remove();
+                    n++;
+                }
+            }
+            return n;
+        }""")
+        if removed:
+            logger.info(f"[{job_id}] SVT 1.8.17: consent-overlay borttagen element={removed}")
+    except Exception:
+        pass
+
+
+def _lb1817_resolve_svt_livepost_by_title_near(job_id: str, article_url: str, inlagg_id: str) -> list:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT 1.8.17: playwright import fail: {e}")
+        return []
+
+    found = []
+    armed = {"value": False}
+
+    def add_url(raw_url: str, source: str) -> None:
+        for candidate in _lb1817_unwrap_media_url(job_id, raw_url):
+            if candidate not in found:
+                found.append(candidate)
+                logger.info(f"[{job_id}] SVT 1.8.17: fångade media ({source}): {candidate}")
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 1800},
+            )
+            page = ctx.new_page()
+
+            def on_request(req):
+                if armed["value"] and _lb1817_looks_like_media_url(req.url):
+                    add_url(req.url, "request-after-click")
+
+            def on_response(res):
+                if not armed["value"]:
+                    return
+                try:
+                    url = res.url
+                    if _lb1817_looks_like_media_url(url):
+                        add_url(url, "response-after-click")
+                    if "switcher.cdn.svt.se/resolve/" in url or "api.svt.se/ditto/api/v3/manifest" in url:
+                        try:
+                            body = res.text()
+                            for m in re.finditer(r'https?:\\?/\\?/[^"\'<>\\\\ ]+', body):
+                                add_url(m.group(0).replace("\\/", "/"), "response-body-after-click")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            page.on("request", on_request)
+            page.on("response", on_response)
+
+            logger.info(f"[{job_id}] SVT 1.8.17: öppnar livepost-sida")
+            try:
+                page.goto(article_url, wait_until="domcontentloaded", timeout=20000)
+            except Exception as e:
+                logger.info(f"[{job_id}] SVT 1.8.17: goto warning: {e}")
+
+            page.wait_for_timeout(2500)
+            _lb1817_accept_or_remove_consent(page, job_id)
+
+            html = page.content()
+            terms = _lb1817_extract_title_terms_from_html(html, inlagg_id)
+            logger.info(f"[{job_id}] SVT 1.8.17: title/near-termer={terms}")
+
+            if not terms:
+                logger.info(f"[{job_id}] SVT 1.8.17: hittade ingen rubrik efter exakt inlägg-id")
+                ctx.close()
+                browser.close()
+                return []
+
+            ranking = page.evaluate(
+                """(terms) => {
+                    const norm = (s) => String(s || '')
+                        .replace(/\\s+/g, ' ')
+                        .replace(/[–—-]/g, ' ')
+                        .trim();
+
+                    const tokens = (s) => {
+                        const stop = new Set([
+                            'spela','rapport','video','sek','min','och','att','det','som',
+                            'för','från','till','med','den','detta','där','här','har',
+                            'hur','vad','när','senaste','nytt','usa','politik','visa',
+                            'länkar','under','meny','öppna','huvudmeny','snabbmeny'
+                        ]);
+                        return norm(s).toLowerCase()
+                            .match(/[a-zåäö0-9]{3,}/g)
+                            ?.filter(w => !stop.has(w)) || [];
+                    };
+
+                    const termTokens = new Set();
+                    for (const t of terms) {
+                        for (const tok of tokens(t)) termTokens.add(tok);
+                    }
+
+                    const textEls = Array.from(document.querySelectorAll(
+                        'h1,h2,h3,h4,p,span,em,strong,[aria-label]'
+                    ));
+
+                    const anchors = [];
+                    for (const el of textEls) {
+                        const raw = el.getAttribute('aria-label') || el.innerText || el.textContent || '';
+                        const txt = norm(raw);
+                        if (!txt) continue;
+
+                        const toks = tokens(txt);
+                        const overlap = toks.filter(t => termTokens.has(t));
+                        const exactHit = terms.some(term => txt.includes(norm(term)) || norm(term).includes(txt));
+
+                        if (overlap.length >= 2 || exactHit) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) {
+                                anchors.push({
+                                    text: txt.slice(0, 180),
+                                    x: r.x,
+                                    y: r.y,
+                                    top: r.top,
+                                    bottom: r.bottom,
+                                    cx: r.x + r.width / 2,
+                                    cy: r.y + r.height / 2,
+                                    overlap,
+                                });
+                            }
+                        }
+                    }
+
+                    const buttons = Array.from(document.querySelectorAll(
+                        'button[data-testid="play-pause-button"], button[data-rt="video-player-splash-play"], button[aria-label*="Spela"]'
+                    ));
+
+                    const rows = buttons.map((btn, index) => {
+                        const label = norm(btn.getAttribute('aria-label') || btn.innerText || btn.textContent || '');
+                        const br = btn.getBoundingClientRect();
+                        const btoks = tokens(label);
+                        const labelOverlap = btoks.filter(t => termTokens.has(t));
+
+                        let bestDistance = 999999;
+                        let bestAnchor = null;
+
+                        for (const a of anchors) {
+                            const dx = Math.abs((br.x + br.width / 2) - a.cx);
+                            let dy = 0;
+
+                            if (br.bottom < a.top) {
+                                dy = a.top - br.bottom;       // button above text, normal SVT case
+                            } else if (a.bottom < br.top) {
+                                dy = br.top - a.bottom;       // button below text
+                            } else {
+                                dy = 0;                       // overlapping/same block
+                            }
+
+                            const dist = dy + dx * 0.35;
+                            if (dist < bestDistance) {
+                                bestDistance = dist;
+                                bestAnchor = a;
+                            }
+                        }
+
+                        let score = 0;
+                        score += labelOverlap.length * 5000;
+                        if (bestDistance < 900) score += Math.max(0, 3000 - bestDistance * 3);
+                        if (labelOverlap.length >= 2) score += 4000;
+                        if (label.toLowerCase().includes('trump')) score += 1000;
+
+                        return {
+                            index,
+                            score: Math.round(score),
+                            label,
+                            y: Math.round(br.y),
+                            bestDistance: Math.round(bestDistance),
+                            labelOverlap,
+                            nearestText: bestAnchor ? bestAnchor.text : '',
+                        };
+                    }).filter(r => r.score > 0)
+                      .sort((a, b) => b.score - a.score);
+
+                    return rows;
+                }""",
+                terms,
+            )
+
+            logger.info(f"[{job_id}] SVT 1.8.17: NEAR-knapp-ranking topp={ranking[:5] if ranking else []}")
+
+            if not ranking:
+                logger.info(f"[{job_id}] SVT 1.8.17: ingen play-knapp matchade rubrik/NEAR")
+                ctx.close()
+                browser.close()
+                return []
+
+            best = ranking[0]
+            best_index = int(best["index"])
+            selector = 'button[data-testid="play-pause-button"], button[data-rt="video-player-splash-play"], button[aria-label*="Spela"]'
+            target = page.locator(selector).nth(best_index)
+
+            try:
+                target.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+
+            _lb1817_accept_or_remove_consent(page, job_id)
+
+            armed["value"] = True
+
+            clicked = False
+            try:
+                target.click(timeout=3500)
+                clicked = True
+                logger.info(f"[{job_id}] SVT 1.8.17: normal klick OK label={best.get('label')}")
+            except Exception as e:
+                logger.info(f"[{job_id}] SVT 1.8.17: normal klick misslyckades, provar force: {e}")
+                try:
+                    target.click(timeout=3500, force=True)
+                    clicked = True
+                    logger.info(f"[{job_id}] SVT 1.8.17: force-klick OK label={best.get('label')}")
+                except Exception as e2:
+                    logger.info(f"[{job_id}] SVT 1.8.17: force-klick misslyckades, provar JS click: {e2}")
+                    try:
+                        page.evaluate(
+                            """(idx) => {
+                                const buttons = Array.from(document.querySelectorAll(
+                                    'button[data-testid="play-pause-button"], button[data-rt="video-player-splash-play"], button[aria-label*="Spela"]'
+                                ));
+                                if (buttons[idx]) buttons[idx].click();
+                            }""",
+                            best_index,
+                        )
+                        clicked = True
+                        logger.info(f"[{job_id}] SVT 1.8.17: JS-klick OK label={best.get('label')}")
+                    except Exception as e3:
+                        logger.info(f"[{job_id}] SVT 1.8.17: JS-klick misslyckades: {e3}")
+
+            if clicked:
+                page.wait_for_timeout(8000)
+
+            # Sista säkra fallback: läs video[src] nära vald knapp, inte globalt.
+            try:
+                near_videos = page.evaluate(
+                    """(idx) => {
+                        const buttons = Array.from(document.querySelectorAll(
+                            'button[data-testid="play-pause-button"], button[data-rt="video-player-splash-play"], button[aria-label*="Spela"]'
+                        ));
+                        const btn = buttons[idx];
+                        if (!btn) return [];
+
+                        const br = btn.getBoundingClientRect();
+                        const bcx = br.x + br.width / 2;
+                        const bcy = br.y + br.height / 2;
+
+                        return Array.from(document.querySelectorAll('video')).map(v => {
+                            const r = v.getBoundingClientRect();
+                            const src = v.currentSrc || v.src || v.getAttribute('src') || '';
+                            const cx = r.x + r.width / 2;
+                            const cy = r.y + r.height / 2;
+                            const dist = Math.abs(cx - bcx) * 0.35 + Math.abs(cy - bcy);
+                            return {src, dist: Math.round(dist)};
+                        }).filter(v => v.src)
+                          .sort((a, b) => a.dist - b.dist)
+                          .slice(0, 3);
+                    }""",
+                    best_index,
+                )
+                logger.info(f"[{job_id}] SVT 1.8.17: video[src] nära vald knapp={near_videos}")
+                for item in near_videos or []:
+                    if int(item.get("dist", 999999)) < 1200:
+                        add_url(item.get("src", ""), "near-video-src")
+            except Exception as e:
+                logger.info(f"[{job_id}] SVT 1.8.17: kunde inte läsa near video[src]: {e}")
+
+            ctx.close()
+            browser.close()
+
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT 1.8.17: resolver misslyckades: {e}")
+
+    if found:
+        logger.info(f"[{job_id}] SVT 1.8.17: slutkandidat={found[0]} totalt={len(found)}")
+    else:
+        logger.info(f"[{job_id}] SVT 1.8.17: ingen media fångad via titel/NEAR")
+
+    return found
+
+
+def _resolve_manifests_via_playwright(job_id: str, article_url: str) -> List[str]:
+    from urllib.parse import parse_qs, urlparse
+
+    try:
+        parsed = urlparse(article_url)
+        inlagg_id = parse_qs(parsed.query).get("inlagg", [""])[0]
+
+        if inlagg_id and "svt.se" in parsed.netloc.lower():
+            logger.info(f"[{job_id}] SVT 1.8.17: använder title/NEAR livepost-resolver för inlägg {inlagg_id}")
+            urls = _lb1817_resolve_svt_livepost_by_title_near(job_id, article_url, inlagg_id)
+            if urls:
+                return urls
+
+            logger.info(
+                f"[{job_id}] SVT 1.8.17: ingen video kunde kopplas till exakt inlägg. "
+                "Avbryter utan global fallback."
+            )
+            return []
+
+    except Exception as e:
+        logger.info(f"[{job_id}] SVT 1.8.17: wrapper misslyckades: {e}")
+
+    return _lb1817_previous_resolve_manifests_via_playwright(job_id, article_url)
+
+# === End LjudBuster 1.8.17-dev override ===
+
